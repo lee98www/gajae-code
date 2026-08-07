@@ -253,8 +253,9 @@ const PROFILE_ROLE_PREVIEW_ORDER: GjcModelAssignmentTargetId[] = [
 	"critic",
 	"architect",
 ];
-const PRESET_SCOPE_LABELS = ["Apply for this session", "Set as default"];
-const CUSTOM_PRESET_SCOPE_LABELS = ["Apply for this session", "Set as default", "Rename", "Delete"];
+const PRESET_SCOPE_LABELS = ["Use for new sessions", "Apply to this session only"];
+const CUSTOM_PRESET_SCOPE_LABELS = ["Use for new sessions", "Apply to this session only", "Rename", "Delete"];
+const PRESET_SCOPE_PERSIST_INDEX = 0;
 
 function isPrintableCharacter(keyData: string): boolean {
 	return keyData.length === 1 && keyData >= " " && keyData !== "\x7f";
@@ -1923,7 +1924,7 @@ export class ModelSelectorComponent extends Container {
 			this.#onSelectCallback({
 				kind: "profile",
 				profileName: this.#previewProfileName,
-				setDefault: this.#presetScopeIndex === 1,
+				setDefault: this.#presetScopeIndex === PRESET_SCOPE_PERSIST_INDEX,
 			});
 			return;
 		}

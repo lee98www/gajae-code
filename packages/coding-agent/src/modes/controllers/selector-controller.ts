@@ -2162,7 +2162,11 @@ export class SelectorController {
 		);
 		this.ctx.statusLine.invalidate();
 		this.ctx.updateEditorBorderColor();
-		this.ctx.showStatus(persistDefault ? `Default model profile: ${profileLabel}` : `Model profile: ${profileLabel}`);
+		this.ctx.showStatus(
+			persistDefault
+				? `Model profile saved for new sessions: ${profileLabel}`
+				: `Model profile applied to this session: ${profileLabel}`,
+		);
 	}
 
 	showModelSelector(options?: { temporaryOnly?: boolean }): void {
