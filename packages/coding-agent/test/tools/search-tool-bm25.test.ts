@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { Settings } from "../../src/config/settings";
 import { buildDiscoverableToolSearchIndex, type DiscoverableTool } from "../../src/tool-discovery/tool-index";
 import type { ToolSession } from "../../src/tools/index";
-import { SearchToolBm25Tool } from "../../src/tools/search-tool-bm25";
+import { renderSearchToolBm25Description, SearchToolBm25Tool } from "../../src/tools/search-tool-bm25";
 
 type DiscoveryToolSession = ToolSession & {
 	isToolDiscoveryEnabled: () => boolean;
@@ -71,5 +71,31 @@ describe("SearchToolBm25Tool", () => {
 		const session = createSession(tools);
 		const result = await new SearchToolBm25Tool(session).execute("call", { query: "find" });
 		expect(result.details?.tools.map(match => match.name)).toEqual(["find"]);
+	});
+	it("rejects a limit above the maximum", async () => {
+		const session = createSession(tools);
+		await expect(new SearchToolBm25Tool(session).execute("call", { query: "github", limit: 9 })).rejects.toThrow(
+			"no greater than 8",
+		);
+	});
+
+	it("accepts the maximum limit and defaults omitted limits to it", async () => {
+		const session = createSession(tools);
+		const tool = new SearchToolBm25Tool(session);
+
+		const atMaximum = await tool.execute("call", { query: "github", limit: 8 });
+		const withDefault = await tool.execute("call", { query: "find" });
+
+		expect(atMaximum.details?.limit).toBe(8);
+		expect(withDefault.details?.limit).toBe(8);
+	});
+
+	it("keeps the model-facing description aligned with the hard maximum", () => {
+		// Regression guard for the prose<->schema drift fixed in 6c2327857:
+		// the advertised range must match the enforced cap.
+		const description = renderSearchToolBm25Description();
+		expect(description).toContain("1–8");
+		expect(description).toContain("values above 8 are rejected");
+		expect(description).not.toMatch(/5–10|5-10/);
 	});
 });

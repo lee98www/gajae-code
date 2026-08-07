@@ -3,7 +3,7 @@ Search hidden tool metadata to discover and activate tools.
 Activate hidden tools (MCP and built-in) when you need a capability not in your active tool set.
 Input:
 - `query` — required natural-language or keyword query
-- `limit` — optional maximum number of tools to return and activate (default `8`; start with 5–10 if unsure)
+- `limit` — optional maximum number of tools to return and activate, 1–8 (default `8`; values above 8 are rejected)
 
 Behavior:
 - Searches hidden tool metadata using BM25-style relevance ranking

@@ -116,6 +116,7 @@ import {
 	type FallbackTriggerClass,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
+import { toolWireSchema } from "@gajae-code/ai/utils/schema/wire";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
@@ -1268,6 +1269,77 @@ const PERMISSION_OPTIONS: ClientBridgePermissionOption[] = [
 ];
 
 const PERMISSION_OPTIONS_BY_ID = new Map(PERMISSION_OPTIONS.map(option => [option.optionId, option]));
+const MAX_SELECTED_DISCOVERED_TOOLS = 8;
+const MAX_SELECTED_DISCOVERED_TOOL_SCHEMA_BYTES = 65_536;
+const MAX_SELECTED_DISCOVERED_TOOL_SCHEMA_TOKENS = 16_384;
+
+/**
+ * Effective provider strict mode: OpenAI-family serializers treat every value
+ * except explicit `false` as strict (`tool.strict !== false`), so undefined and
+ * true are equivalent on the wire while false is a distinct contract.
+ */
+function effectiveToolStrictMode(tool: AgentTool): boolean {
+	return tool.strict !== false;
+}
+
+/**
+ * Serialize the complete selected discoverable-tool batch in provider wire
+ * form (`{type:"function",name,description,parameters,strict}` per tool, with
+ * `name: tool.name` exactly as the OpenAI-family function serializer frames
+ * it — `customWireName` belongs to the separate `type:"custom"` branch) so the
+ * budget guard measures what the provider request actually carries. Fails
+ * closed: a serialization error rejects the batch instead of silently
+ * under-measuring it.
+ */
+function serializeDiscoverableToolWireBatch(tools: AgentTool[]): string {
+	return JSON.stringify(
+		tools.map(tool => ({
+			type: "function",
+			name: tool.name,
+			description: tool.description ?? "",
+			parameters: toolWireSchema(tool as never),
+			strict: effectiveToolStrictMode(tool),
+		})),
+	);
+}
+
+/**
+ * Stable fingerprint of a tool's provider-visible wire schema, so epoch/prompt
+ * signature detection covers schema mutations that keep name/label/description
+ * unchanged (e.g. an MCP refresh that only alters parameters or strictness).
+ * Cached by the CURRENT parameters object identity plus effective strict mode,
+ * not by tool identity: tools like Ask/Task/Edit expose dynamic `parameters`
+ * getters that return different schema objects per stage/setting, and a stale
+ * per-tool cache would miss those supported transitions. In-place mutation of
+ * a schema object remains out of contract (schema instances are treated as
+ * immutable once produced).
+ */
+const toolWireSchemaFingerprintCache = new WeakMap<object, { strict: boolean; fingerprint: string }>();
+function toolWireSchemaFingerprint(tool: AgentTool): string {
+	const strict = effectiveToolStrictMode(tool);
+	// Dynamic `parameters` getters may throw; a poisoned tool must degrade to
+	// the unserializable fingerprint instead of breaking signature computation.
+	let parameters: unknown;
+	try {
+		parameters = tool.parameters;
+	} catch {
+		parameters = undefined;
+	}
+	const cacheKey = typeof parameters === "object" && parameters !== null ? parameters : undefined;
+	if (cacheKey) {
+		const cached = toolWireSchemaFingerprintCache.get(cacheKey);
+		if (cached !== undefined && cached.strict === strict) return cached.fingerprint;
+	}
+	let serialized: string;
+	try {
+		serialized = JSON.stringify({ parameters: toolWireSchema(tool as never), strict });
+	} catch {
+		serialized = "unserializable";
+	}
+	const fingerprint = crypto.createHash("sha256").update(serialized).digest("hex").slice(0, 16);
+	if (cacheKey) toolWireSchemaFingerprintCache.set(cacheKey, { strict, fingerprint });
+	return fingerprint;
+}
 
 function getStringProperty(value: Record<string, unknown>, key: string): string | undefined {
 	const candidate = value[key];
@@ -2058,6 +2130,8 @@ export class AgentSession {
 	// Generic tool discovery (covers built-in + MCP + extension when tools.discoveryMode === "all")
 	#discoverableToolSearchIndex: DiscoverableToolSearchIndex | null = null;
 	#selectedDiscoveredToolNames = new Set<string>();
+	#discoveredToolEpoch = 0;
+	#discoveredToolEpochReason: string | undefined;
 	#baselineDiscoveredBuiltinToolNames = new Set<string>();
 	#discoverableToolAllowedNames: ReadonlySet<string> | undefined;
 	#gjcSubskillToolNames = new Set<string>();
@@ -6671,19 +6745,27 @@ export class AgentSession {
 		const mcpSelected = this.getSelectedMCPToolNames();
 		return [...new Set([...mcpSelected, ...this.#getSelectedDiscoveredBuiltinToolNames()])];
 	}
+	getDiscoveredToolEpoch(): { epoch: number; reason: string | undefined } {
+		return { epoch: this.#discoveredToolEpoch, reason: this.#discoveredToolEpochReason };
+	}
 
 	async activateDiscoveredTools(toolNames: string[]): Promise<string[]> {
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
 		const previousSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
 		const nextActiveToolNames = this.getActiveToolNames();
 		const nextActiveNameSet = new Set(nextActiveToolNames);
-		const nextSelectedDiscoveredBuiltinToolNames = new Set(this.#selectedDiscoveredToolNames);
+		const nextSelectedDiscoveredBuiltinToolNames = new Set(previousSelectedDiscoveredBuiltinToolNames);
+		const nextSelectedDiscoveredToolNames = new Set([
+			...previousSelectedMCPToolNames,
+			...previousSelectedDiscoveredBuiltinToolNames,
+		]);
 		const activated: string[] = [];
 		for (const name of new Set(toolNames)) {
 			if (this.#discoverableMCPTools.has(name) && this.#toolRegistry.has(name)) {
 				if (!nextActiveNameSet.has(name)) {
 					nextActiveToolNames.push(name);
 					nextActiveNameSet.add(name);
+					nextSelectedDiscoveredToolNames.add(name);
 					activated.push(name);
 				}
 				continue;
@@ -6694,16 +6776,59 @@ export class AgentSession {
 				nextActiveToolNames.push(name);
 				nextActiveNameSet.add(name);
 				nextSelectedDiscoveredBuiltinToolNames.add(name);
+				nextSelectedDiscoveredToolNames.add(name);
 				activated.push(name);
 			}
 		}
-		if (activated.length > 0) {
-			await this.#applyActiveToolsByName(nextActiveToolNames, {
-				previousSelectedMCPToolNames,
-				previousSelectedDiscoveredBuiltinToolNames,
-				nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
-			});
+		if (activated.length === 0) return activated;
+
+		const selectedTools = [...nextSelectedDiscoveredToolNames]
+			.map(name => this.#toolRegistry.get(name))
+			.filter((tool): tool is AgentTool => tool !== undefined);
+		let rejectionReason: string | undefined;
+		if (selectedTools.length > MAX_SELECTED_DISCOVERED_TOOLS) {
+			rejectionReason = `selected discoverable tool limit is ${MAX_SELECTED_DISCOVERED_TOOLS} (requested ${selectedTools.length})`;
+		} else {
+			// Fail closed: a wire-serialization failure rejects the batch instead of
+			// silently under-measuring what the provider request would carry.
+			let serializedWireBatch: string | undefined;
+			try {
+				serializedWireBatch = serializeDiscoverableToolWireBatch(selectedTools);
+			} catch (error) {
+				rejectionReason = `tool schema wire serialization failed (${error instanceof Error ? error.message : String(error)})`;
+			}
+			if (serializedWireBatch !== undefined) {
+				const serializedSchemaBytes = utf8ByteLength(serializedWireBatch);
+				// Independent script-aware token estimate: token-dense UTF-8 (CJK/Hangul)
+				// can exceed the token cap well below the byte cap.
+				const estimatedSchemaTokens = estimateTextTokensHeuristic(serializedWireBatch);
+				if (serializedSchemaBytes > MAX_SELECTED_DISCOVERED_TOOL_SCHEMA_BYTES) {
+					rejectionReason =
+						`serialized discoverable tool schema budget is ${MAX_SELECTED_DISCOVERED_TOOL_SCHEMA_BYTES} bytes ` +
+						`(requested ${serializedSchemaBytes} bytes)`;
+				} else if (estimatedSchemaTokens > MAX_SELECTED_DISCOVERED_TOOL_SCHEMA_TOKENS) {
+					rejectionReason =
+						`serialized discoverable tool schema budget is ${MAX_SELECTED_DISCOVERED_TOOL_SCHEMA_TOKENS} estimated tokens ` +
+						`(requested ${estimatedSchemaTokens} tokens)`;
+				}
+			}
 		}
+		if (rejectionReason) {
+			await this.#emitSessionEvent({
+				type: "notice",
+				level: "warning",
+				source: "tool-discovery",
+				message: `Discovered tool activation rejected: ${rejectionReason}.`,
+			});
+			return [];
+		}
+
+		await this.#applyActiveToolsByName(nextActiveToolNames, {
+			previousSelectedMCPToolNames,
+			previousSelectedDiscoveredBuiltinToolNames,
+			nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
+			discoveredToolEpochReason: `activation:${activated.join(",")}`,
+		});
 		return activated;
 	}
 
@@ -6898,6 +7023,7 @@ export class AgentSession {
 			previousSelectedMCPToolNames?: string[];
 			previousSelectedDiscoveredBuiltinToolNames?: string[];
 			nextSelectedDiscoveredBuiltinToolNames?: string[];
+			discoveredToolEpochReason?: string;
 		},
 	): Promise<void> {
 		toolNames = [...new Set([...toolNames.map(name => name.toLowerCase()), ...this.#mandatoryMCPToolNames])];
@@ -6936,6 +7062,10 @@ export class AgentSession {
 		const signature = this.#computeAppliedToolSignature(validToolNames, tools);
 		const promptRelevantToolsChanged =
 			signature !== (this.#pendingAppliedToolSignature ?? this.#lastAppliedToolSignature);
+		if (promptRelevantToolsChanged) {
+			this.#discoveredToolEpoch++;
+			this.#discoveredToolEpochReason = options?.discoveredToolEpochReason ?? "tool-set-change";
+		}
 		if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
 			const generation = this.#reserveBaseSystemPromptGeneration();
 			try {
@@ -7013,7 +7143,7 @@ export class AgentSession {
 		if (refreshedTool && sshAllowed && (wasActive || (options?.activateIfAvailable && !hadSshTool))) {
 			nextActive.push(refreshedTool.name);
 		}
-		await this.#applyActiveToolsByName(nextActive);
+		await this.#applyActiveToolsByName(nextActive, { discoveredToolEpochReason: "refresh:ssh" });
 	}
 
 	/**
@@ -7021,9 +7151,12 @@ export class AgentSession {
 	 * Only tools in the registry can be enabled. Unknown tool names are ignored.
 	 * Also rebuilds the system prompt to reflect the new tool set.
 	 * Changes take effect before the next model call.
+	 *
+	 * Explicit user selection remains unrestricted; discoverable-tool caps apply
+	 * only to activateDiscoveredTools.
 	 */
 	async setActiveToolsByName(toolNames: string[]): Promise<void> {
-		await this.#applyActiveToolsByName(toolNames);
+		await this.#applyActiveToolsByName(toolNames, { discoveredToolEpochReason: "set-active-tools" });
 	}
 
 	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
@@ -7050,7 +7183,7 @@ export class AgentSession {
 		this.#selectedDiscoveredToolNames = new Set(restoredDiscoveredBuiltinToolNames);
 		await this.#applyActiveToolsByName(
 			[...nextActiveNonMCPToolNames, ...restoredMCPToolNames, ...restoredDiscoveredBuiltinToolNames],
-			{ persistMCPSelection: false },
+			{ persistMCPSelection: false, discoveredToolEpochReason: "restore" },
 		);
 		await this.#attachAskToolIfWorkflowActive();
 	}
@@ -7123,7 +7256,11 @@ export class AgentSession {
 	 * are read live on every call, so a settings flip that changes rendered metadata
 	 * changes the signature. Do not cache per-tool strings without preserving this.
 	 *
-	 * Inputs NOT covered: tool input schemas; memory instructions read from disk;
+	 * Tool input schemas ARE covered via `toolWireSchemaFingerprint` (wire
+	 * parameters + effective strict mode, cached by current parameters object
+	 * identity so dynamic parameter getters invalidate naturally).
+	 *
+	 * Inputs NOT covered: memory instructions read from disk;
 	 * and SDK-init-time closure constants in `sdk/session.ts` (`repeatToolDescriptions`,
 	 * `eagerTasks`, `intentField`, `mcpDiscoveryEnabled`, `secretsEnabled`). The
 	 * closure-captured ones cannot change at runtime regardless of skip behavior.
@@ -7145,7 +7282,7 @@ export class AgentSession {
 		// the rebuild fires and the new tool list reaches the API.
 		const nameSegment = toolNames.join("\u0001");
 		const describeTool = (tool: AgentTool): string =>
-			`${tool.name}=${tool.label ?? ""}|${tool.description ?? ""}|${tool.customWireName ?? ""}`;
+			`${tool.name}=${tool.label ?? ""}|${tool.description ?? ""}|${tool.customWireName ?? ""}|${toolWireSchemaFingerprint(tool)}`;
 		const descriptionSegment = tools.map(describeTool).join("\u0002");
 		let registrySegment = "";
 		if (this.#mcpDiscoveryEnabled) {

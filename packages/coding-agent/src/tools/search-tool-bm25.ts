@@ -25,7 +25,7 @@ const MATCH_DESCRIPTION_LEN = 96;
 
 const searchToolBm25Schema = z.object({
 	query: z.string().describe("tool search query"),
-	limit: z.number().int().min(1).optional().describe("max matches"),
+	limit: z.number().int().min(1).max(8).optional().describe("max matches"),
 });
 
 type SearchToolBm25Params = z.infer<typeof searchToolBm25Schema>;
@@ -185,8 +185,8 @@ export class SearchToolBm25Tool implements AgentTool<typeof searchToolBm25Schema
 			throw new ToolError("Query is required and must not be empty.");
 		}
 		const limit = params.limit ?? DEFAULT_LIMIT;
-		if (!Number.isInteger(limit) || limit <= 0) {
-			throw new ToolError("Limit must be a positive integer.");
+		if (!Number.isInteger(limit) || limit <= 0 || limit > DEFAULT_LIMIT) {
+			throw new ToolError(`Limit must be a positive integer no greater than ${DEFAULT_LIMIT}.`);
 		}
 
 		const searchIndex = getDiscoverableToolSearchIndexForExecution(this.session);
