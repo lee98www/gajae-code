@@ -174,6 +174,24 @@ describe("ultragoal ask guard", () => {
 		expect(execute).not.toHaveBeenCalled();
 	});
 
+	it("allows wrapped ask when only another session has active ultragoal state", async () => {
+		const cwd = await tempDir();
+		const otherSessionId = "ultragoal-other-session";
+		const currentSessionId = "ask-current-session";
+		process.env.GJC_SESSION_ID = otherSessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement an unrelated story" });
+		const execute = vi.fn(async () => {});
+		const guarded = guardToolForUltragoalAsk(
+			stubAskTool(execute),
+			() => cwd,
+			() => ({ sessionId: currentSessionId }),
+		);
+
+		await guarded.execute("call", {}, undefined, undefined, undefined as never);
+
+		expect(execute).toHaveBeenCalledTimes(1);
+	});
+
 	it("preserves `this` for a prototype-method ask tool when ultragoal is inactive (regression)", async () => {
 		const cwd = await tempDir();
 		const tool = new StubExtensionWrappedAskTool();

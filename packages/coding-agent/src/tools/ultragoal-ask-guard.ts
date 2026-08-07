@@ -15,22 +15,15 @@ export interface UltragoalAskGuardContext {
 	sessionId?: string | null;
 }
 
-const UPSTREAM_PLANNING_ASK_SKILLS = new Set(["deep-interview", "ralplan"]);
-
-function normalizedActiveSkill(context?: UltragoalAskGuardContext): string | undefined {
-	const skill = context?.activeSkillState?.skill?.trim();
-	return skill || undefined;
-}
-
-function sessionScopedAskGuardId(
-	context: UltragoalAskGuardContext,
-	activeSkill: string | undefined,
-): string | undefined {
-	if (activeSkill !== "ultragoal" && !UPSTREAM_PLANNING_ASK_SKILLS.has(activeSkill ?? "")) return undefined;
-	const activeSessionId = context.activeSkillState?.session_id?.trim();
-	if (activeSessionId) return activeSessionId;
+function sessionScopedAskGuardId(context: UltragoalAskGuardContext): string | undefined {
+	// The live AgentSession id is authoritative. Active workflow state can be
+	// absent when a root-launched session operates on a repo-scoped workflow,
+	// and falling back to ambient/latest-session resolution in that case lets an
+	// unrelated Ultragoal run hijack this session's ask calls.
 	const sessionId = context.sessionId?.trim();
-	return sessionId || undefined;
+	if (sessionId) return sessionId;
+	const activeSessionId = context.activeSkillState?.session_id?.trim();
+	return activeSessionId || undefined;
 }
 
 export function formatUltragoalAskBlockMessage(diagnostic: UltragoalAskBlockDiagnostic): string {
@@ -42,13 +35,9 @@ export function formatUltragoalAskBlockMessage(diagnostic: UltragoalAskBlockDiag
 }
 
 export async function assertUltragoalAskAllowed(cwd: string, context: UltragoalAskGuardContext = {}): Promise<void> {
-	const activeSkill = normalizedActiveSkill(context);
-	// Deep-interview and ralplan are upstream planning workflows whose core gates
-	// are `ask` calls. Scope their Ultragoal check to the current session so stale
-	// or ambiguous Ultragoal durable state from another session cannot hijack those
-	// prompts; same-session active Ultragoal state still falls through to the
-	// blocker/nudge checks below.
-	const sessionId = sessionScopedAskGuardId(context, activeSkill);
+	// Always scope the check to the live agent session when one is available.
+	// Callers without session context retain legacy ambient resolution.
+	const sessionId = sessionScopedAskGuardId(context);
 	const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
 	if (!diagnostic.active) return;
 	const nudge = await consumeUltragoalAskNudge(cwd, sessionId);

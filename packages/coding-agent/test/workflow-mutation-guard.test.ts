@@ -7,6 +7,7 @@ import {
 	activeSnapshotPath,
 	modeStatePath,
 	sessionStateDir,
+	sessionUltragoalDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import {
@@ -466,6 +467,63 @@ describe("workflow mutation guard", () => {
 			expect(decision.targets.length).toBeGreaterThan(0);
 		}
 	});
+	it("ignores quoted arrows in checkpoint evidence while preserving redirect detection", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ultragoal", "goal-planning");
+
+		const checkpoint = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: { command: 'gjc ultragoal checkpoint --evidence "51 BLOCK -> 52"' },
+		});
+		expect(checkpoint.blocked).toBe(false);
+		expect(checkpoint.targets).toEqual([]);
+
+		for (const [command, target] of [
+			["echo hi > out.txt", "out.txt"],
+			["cmd 2> err.txt", "err.txt"],
+			["cmd >> log.txt", "log.txt"],
+		] as const) {
+			const redirect = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(redirect.blocked).toBe(true);
+			expect(redirect.targets).toEqual([target]);
+		}
+	});
+
+	it("never planning-blocks sanctioned ultragoal checkpoint statements", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ultragoal", "goal-planning");
+
+		for (const command of [
+			"gjc ultragoal checkpoint --quality-gate-json /tmp/x.json",
+			"gjc ultragoal checkpoint --quality-gate-json /tmp/x.json > checkpoint.txt",
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(false);
+		}
+
+		const productMutation = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: {
+				command: "gjc ultragoal checkpoint --quality-gate-json /tmp/x.json; echo hi > src/product.ts",
+			},
+		});
+		expect(productMutation.blocked).toBe(true);
+		expect(productMutation.targets).toEqual(["src/product.ts"]);
+	});
 
 	it("allows the /dev/null sink during active deep-interview", async () => {
 		const cwd = await makeTempRoot();
@@ -725,7 +783,7 @@ describe("workflow mutation guard", () => {
 		expect(gjcBash.blocked).toBe(false);
 	});
 
-	it("blocks product mutation only during the ultragoal goal-planning phase", async () => {
+	it("keeps ultragoal goal-planning blocked with no durable goals file, but allows executing phases", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ultragoal", "goal-planning");
 
@@ -747,6 +805,22 @@ describe("workflow mutation guard", () => {
 			args: { path: "src/product.ts", content: "x" },
 		});
 		expect(executing.blocked).toBe(false);
+	});
+	it("releases ultragoal goal planning when durable goals are populated", async () => {
+		const cwd = await makeTempRoot();
+		const sessionId = "session-a";
+		await writeActiveSkill(cwd, "ultragoal", "goal-planning", sessionId);
+		const goalsPath = path.join(sessionUltragoalDir(cwd, sessionId), "goals.json");
+		await fs.mkdir(path.dirname(goalsPath), { recursive: true });
+		await Bun.write(goalsPath, `${JSON.stringify({ goals: [{ id: "G001" }] })}\n`);
+
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId,
+			tool: tool("write"),
+			args: { path: "src/product.ts", content: "x" },
+		});
+		expect(decision.blocked).toBe(false);
 	});
 
 	it("does not block product mutation while team is active", async () => {

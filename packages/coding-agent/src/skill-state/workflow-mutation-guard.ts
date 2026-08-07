@@ -4,7 +4,11 @@ import * as path from "node:path";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
 import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
-import { GJC_SESSION_PREFIX, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
+import {
+	GJC_SESSION_PREFIX,
+	modeStatePath as sessionModeStatePath,
+	sessionUltragoalDir,
+} from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema } from "../gjc-runtime/state-schema";
 import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
@@ -50,7 +54,7 @@ const ARCHIVE_OR_SQLITE_BASE_RE = /^(.+?\.(?:tar\.gz|sqlite3|sqlite|db3|zip|tgz|
 const INTERNAL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const VIM_FILE_SWITCH_RE = /^\s*:(?:e|e!|edit|edit!)(?:\s+([^<\r\n]+))?(?:<CR>|\r|\n|$)/i;
 const BASH_MUTATION_COMMAND_RE =
-	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\b([^;&|\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
+	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\b([^;&|\n]*)|(?:^|[^<>-])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
 const BASH_IN_PLACE_MUTATION_COMMAND_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:sed|perl)\b([^;&|\n]*)/gi;
 const BASH_OPAQUE_INTERPRETER_WRITE_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:-c|-e)\b[^;&|\n]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
@@ -311,6 +315,12 @@ async function getActivePlanningSkill(
 	if (!modeStateMatchesContext(modeState, resolvedSessionId, threadId)) return null;
 	const phase = String(modeState.current_phase ?? current.phase ?? "").trim();
 	if (!isBlockingPlanningPhase(current.skill, phase)) return null;
+	if (
+		current.skill === "ultragoal" &&
+		(await hasPopulatedUltragoalGoals(cwd, resolvedSessionId, modeState))
+	) {
+		return null;
+	}
 	return { skill: current.skill, phase };
 }
 
@@ -326,6 +336,24 @@ function addPath(targets: ExtractedTargets, value: unknown): void {
 
 function getRecord(value: unknown): Record<string, unknown> | null {
 	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+async function hasPopulatedUltragoalGoals(cwd: string, sessionId: string, state: ModeState): Promise<boolean> {
+	const configuredPath = safeString(state.goals_path).trim();
+	const resolvedCwd = path.resolve(cwd);
+	const goalsPaths = [
+		configuredPath ? path.resolve(resolvedCwd, configuredPath) : undefined,
+		path.join(sessionUltragoalDir(resolvedCwd, sessionId), "goals.json"),
+		path.join(resolvedCwd, ".gjc", "ultragoal", "goals.json"),
+	].filter((goalsPath): goalsPath is string => Boolean(goalsPath));
+	for (const goalsPath of new Set(goalsPaths)) {
+		try {
+			const goalsState = getRecord(JSON.parse(await Bun.file(goalsPath).text()));
+			if (Array.isArray(goalsState?.goals) && goalsState.goals.length > 0) return true;
+		} catch {
+			// Missing, unreadable, or malformed goals state leaves the planning guard active.
+		}
+	}
+	return false;
 }
 
 function extractWriteTargets(args: unknown): ExtractedTargets {
@@ -418,6 +446,71 @@ function shellWords(argsText: string): string[] {
 
 function cleanShellWord(value: string): string {
 	return value.replace(/^['"]|['"]$/g, "");
+}
+function isInsideQuotedShellSpan(command: string, index: number): boolean {
+	let quote: "'" | '"' | null = null;
+	for (let cursor = 0; cursor < index; cursor++) {
+		const character = command[cursor];
+		if (quote === "'") {
+			if (character === "'") quote = null;
+			continue;
+		}
+		if (quote === '"') {
+			if (character === "\\") {
+				cursor++;
+				continue;
+			}
+			if (character === '"') quote = null;
+			continue;
+		}
+		if (character === "\\") {
+			cursor++;
+			continue;
+		}
+		if (character === "'" || character === '"') quote = character;
+	}
+	return quote !== null;
+}
+
+function shellStatementStart(command: string, index: number): number {
+	let statementStart = 0;
+	let quote: "'" | '"' | null = null;
+	for (let cursor = 0; cursor < index; cursor++) {
+		const character = command[cursor];
+		if (quote === "'") {
+			if (character === "'") quote = null;
+			continue;
+		}
+		if (quote === '"') {
+			if (character === "\\") {
+				cursor++;
+				continue;
+			}
+			if (character === '"') quote = null;
+			continue;
+		}
+		if (character === "\\") {
+			cursor++;
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			quote = character;
+			continue;
+		}
+		if (character === ";" || character === "&" || character === "|" || character === "\n") {
+			statementStart = cursor + 1;
+		}
+	}
+	return statementStart;
+}
+
+function isSanctionedGjcWorkflowStatement(command: string, index: number): boolean {
+	const words = shellWords(command.slice(shellStatementStart(command, index), index)).map(cleanShellWord);
+	let commandIndex = 0;
+	while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[commandIndex] ?? "")) commandIndex++;
+	if (words[commandIndex] !== "gjc") return false;
+	const subcommand = words[commandIndex + 1];
+	return subcommand === "ultragoal" || subcommand === "ralplan" || subcommand === "deep-interview" || subcommand === "state";
 }
 
 /**
@@ -974,6 +1067,15 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		targets.explicitMutation = true;
 		const redirected = match[2]?.trim();
 		if (redirected) {
+			const redirectOffset = match[0].indexOf(">");
+			const redirectIndex = (match.index ?? 0) + redirectOffset;
+			if (
+				redirectOffset < 0 ||
+				isInsideQuotedShellSpan(command, redirectIndex) ||
+				isSanctionedGjcWorkflowStatement(command, redirectIndex)
+			) {
+				continue;
+			}
 			const cleaned = cleanShellWord(redirected);
 			// A capture that dequotes to nothing (e.g. `>" src.ts"`) is a truncated parse, not a safe no-op.
 			if (!cleaned) targets.unknown = true;
