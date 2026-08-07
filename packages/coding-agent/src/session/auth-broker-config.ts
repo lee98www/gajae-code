@@ -47,6 +47,30 @@ interface ConfigSnapshot {
 	token?: string;
 }
 
+/**
+ * Read one string setting from parsed config.yml, honouring BOTH shapes:
+ *   - flat literal key:  `"auth.broker.url": http://...`
+ *   - nested path:       `auth:\n  broker:\n    url: http://...`
+ *
+ * The nested shape is what the Settings system itself writes and reads (dotted
+ * schema keys resolve via `getByPath(..., key.split("."))` — see settings.ts),
+ * so a config produced by `gjc config set auth.broker.url ...` or hand-written
+ * the canonical way is nested. Reading only the flat literal key silently
+ * returned no URL for such configs, so every process fell back to the local
+ * SQLite store while the broker idled — concurrent processes then raced the
+ * single-use OAuth refresh rotation and permanently invalidated credentials.
+ */
+function readConfigString(record: Record<string, unknown>, dottedKey: string): string | undefined {
+	const flat = record[dottedKey];
+	if (typeof flat === "string") return flat;
+	let cursor: unknown = record;
+	for (const segment of dottedKey.split(".")) {
+		if (!cursor || typeof cursor !== "object" || Array.isArray(cursor)) return undefined;
+		cursor = (cursor as Record<string, unknown>)[segment];
+	}
+	return typeof cursor === "string" ? cursor : undefined;
+}
+
 async function readConfigYaml(): Promise<ConfigSnapshot> {
 	const configPath = path.join(getAgentDir(), "config.yml");
 	try {
@@ -54,10 +78,10 @@ async function readConfigYaml(): Promise<ConfigSnapshot> {
 		const parsed = YAML.parse(raw);
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
 		const record = parsed as Record<string, unknown>;
-		const url = typeof record["auth.broker.url"] === "string" ? (record["auth.broker.url"] as string) : undefined;
-		const token =
-			typeof record["auth.broker.token"] === "string" ? (record["auth.broker.token"] as string) : undefined;
-		return { url, token };
+		return {
+			url: readConfigString(record, "auth.broker.url"),
+			token: readConfigString(record, "auth.broker.token"),
+		};
 	} catch (err) {
 		if (isEnoent(err)) return {};
 		logger.warn("auth-broker config.yml unreadable", { error: String(err) });
