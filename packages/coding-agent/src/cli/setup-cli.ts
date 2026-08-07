@@ -581,7 +581,7 @@ export async function handleCredentialsSetup(
 	},
 	deps: CredentialsSetupDependencies = {},
 ): Promise<void> {
-	const discoveryOptions = flags.keychain ? undefined : { readClaudeKeychain: async () => null };
+	const discoveryOptions = flags.keychain ? { includeClaudeKeychain: true } : { readClaudeKeychain: async () => null };
 	const store = await (deps.openStore ?? SqliteAuthCredentialStore.open)(getAgentDbPath());
 	const authStorage = deps.createAuthStorage?.(store) ?? new AuthStorage(store);
 	await authStorage.reload();

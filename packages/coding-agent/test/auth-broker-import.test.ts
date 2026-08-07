@@ -107,6 +107,41 @@ describe("auth-broker import (CLIProxyAPI)", () => {
 		}
 	});
 
+	test("imports Claude token slot JSONs with sidecar account hints", async () => {
+		await writeCliProxyJson("slot7.oauth.json", {
+			accessToken: "claude-slot-access",
+			refreshToken: "claude-slot-refresh",
+			expiresAt: 4_102_444_799,
+		});
+		await Bun.write(
+			path.join(cliproxyDir, "slot7.meta"),
+			JSON.stringify({ label: "wontae", account_hint: "wontae@toonion.co.kr" }),
+		);
+
+		const restore = silenceStdout();
+		await runAuthBrokerCommand({
+			action: "import",
+			flags: { source: cliproxyDir, json: false },
+		});
+		restore();
+
+		const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+		try {
+			const rows = store.listAuthCredentials("anthropic");
+			expect(rows).toHaveLength(1);
+			const credential = rows[0]?.credential;
+			expect(credential?.type).toBe("oauth");
+			if (credential?.type === "oauth") {
+				expect(credential.access).toBe("claude-slot-access");
+				expect(credential.refresh).toBe("claude-slot-refresh");
+				expect(credential.email).toBe("wontae@toonion.co.kr");
+				expect(credential.expires).toBe(4_102_444_799_000);
+			}
+		} finally {
+			store.close();
+		}
+	});
+
 	test("dry-run does not write any credentials", async () => {
 		await writeCliProxyJson("claude.json", {
 			type: "claude",

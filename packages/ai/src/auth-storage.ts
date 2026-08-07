@@ -1308,30 +1308,26 @@ export class AuthStorage {
 	}
 
 	/**
-	 * FNV-1a hash for deterministic session-to-credential mapping.
-	 * Ensures the same session always starts with the same credential.
+	 * Builds a wrapped credential order from a start index.
 	 */
-	#getHashedIndex(sessionId: string, total: number): number {
-		if (total <= 1) return 0;
-		return Bun.hash.xxHash32(sessionId) % total;
-	}
-
-	/**
-	 * Returns credential indices in priority order for selection.
-	 * With sessionId: starts from hashed index (consistent per session).
-	 * Without sessionId: starts from round-robin index (load balancing).
-	 * Order wraps around so all credentials are tried if earlier ones are blocked.
-	 */
-	#getCredentialOrder(providerKey: string, sessionId: string | undefined, total: number): number[] {
-		if (total <= 1) return [0];
-		const start = sessionId
-			? this.#getHashedIndex(sessionId, total)
-			: this.#getNextRoundRobinIndex(providerKey, total);
+	#buildCredentialOrder(start: number, total: number): number[] {
 		const order: number[] = [];
 		for (let i = 0; i < total; i++) {
 			order.push((start + i) % total);
 		}
 		return order;
+	}
+
+	/**
+	 * Returns credential indices in priority order for selection.
+	 * Fresh sessions use round-robin so concurrent sessions spread across the
+	 * pool instead of relying on hash luck. Existing session stickiness is handled
+	 * by callers through #getSessionCredential, so prompt-cache affinity is kept
+	 * until that credential is blocked or explicitly cleared.
+	 */
+	#getCredentialOrder(providerKey: string, total: number): number[] {
+		if (total <= 1) return [0];
+		return this.#buildCredentialOrder(this.#getNextRoundRobinIndex(providerKey, total), total);
 	}
 
 	/** Returns block expiry timestamp for a credential, cleaning up expired entries. */
@@ -1470,7 +1466,8 @@ export class AuthStorage {
 	/**
 	 * Selects a credential of the specified type for a provider.
 	 * Returns both the credential and its index in the original array (for updates/removal).
-	 * Uses deterministic hashing for session stickiness and skips blocked credentials when possible.
+	 * Reuses a non-blocked session-sticky credential first, otherwise round-robins
+	 * fresh selections while skipping temporarily blocked credentials when possible.
 	 */
 	#selectCredentialByType<T extends AuthCredential["type"]>(
 		provider: string,
@@ -1489,7 +1486,15 @@ export class AuthStorage {
 		if (credentials.length === 1) return credentials[0];
 
 		const providerKey = this.#getProviderTypeKey(provider, type);
-		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
+		const sessionCredential = this.#getSessionCredential(provider, sessionId);
+		if (sessionCredential?.type === type) {
+			const preferred = credentials.find(entry => entry.index === sessionCredential.index);
+			if (preferred && !this.#isCredentialBlocked(providerKey, preferred.index)) {
+				return preferred;
+			}
+		}
+
+		const order = this.#getCredentialOrder(providerKey, credentials.length);
 		const fallback = credentials[order[0]];
 
 		for (const idx of order) {
@@ -1602,6 +1607,23 @@ export class AuthStorage {
 		this.#emitCredentialDisabled({ provider, disabledCause });
 	}
 
+	getActiveCredentialById(id: number): StoredAuthCredential | undefined {
+		for (const [provider, entries] of this.#data) {
+			const entry = entries.find(candidate => candidate.id === id);
+			if (!entry) continue;
+			return { id: entry.id, provider, credential: entry.credential, disabledCause: null };
+		}
+		return undefined;
+	}
+
+	disableCredentialByIdIfMatches(id: number, expectedCredential: AuthCredential, disabledCause: string): boolean {
+		for (const [provider, entries] of this.#data) {
+			const index = entries.findIndex(entry => entry.id === id);
+			if (index === -1) continue;
+			return this.#tryDisableCredentialAtIfMatches(provider, index, expectedCredential, disabledCause);
+		}
+		return false;
+	}
 	#emitCredentialDisabled(event: CredentialDisabledEvent): void {
 		if (this.#credentialDisabledListeners.size === 0) {
 			// No subscribers — buffer for later replay. Cap the backlog so a process that runs
@@ -3044,6 +3066,34 @@ export class AuthStorage {
 
 		return remainingCredentials.some(candidate => !this.#isCredentialBlocked(providerKey, candidate.index));
 	}
+	/**
+	 * Marks the current session's credential as temporarily unavailable after a
+	 * transient per-credential failure, then clears session stickiness so the next
+	 * retry can pick another account. Returns true when another unblocked
+	 * credential of the same type is immediately available.
+	 */
+	markTransientCredentialFailure(
+		provider: string,
+		sessionId: string | undefined,
+		options?: { backoffMs?: number },
+	): boolean {
+		const sessionCredential = this.#getSessionCredential(provider, sessionId);
+		if (!sessionCredential) return false;
+
+		const providerKey = this.#getProviderTypeKey(provider, sessionCredential.type);
+		const backoffMs = Math.max(1, options?.backoffMs ?? AuthStorage.#defaultBackoffMs);
+		this.#clearSessionCredential(provider, sessionId);
+		this.#markCredentialBlocked(providerKey, sessionCredential.index, Date.now() + backoffMs);
+
+		const remainingCredentials = this.#getCredentialsForProvider(provider)
+			.map((credential, index) => ({ credential, index }))
+			.filter(
+				(entry): entry is { credential: AuthCredential; index: number } =>
+					entry.credential.type === sessionCredential.type && entry.index !== sessionCredential.index,
+			);
+
+		return remainingCredentials.some(candidate => !this.#isCredentialBlocked(providerKey, candidate.index));
+	}
 
 	#resolveWindowResetAt(window: UsageLimit["window"]): number | undefined {
 		if (!window) return undefined;
@@ -3092,6 +3142,7 @@ export class AuthStorage {
 		credentials: Array<{ credential: OAuthCredential; index: number }>;
 		options?: AuthApiKeyOptions;
 		strategy: CredentialRankingStrategy;
+		preserveHealthyOrder?: boolean;
 	}): Promise<
 		Array<{
 			selection: { credential: OAuthCredential; index: number };
@@ -3207,6 +3258,7 @@ export class AuthStorage {
 				const rightPlanPriority = getOpenAICodexPlanPriority(right.usage);
 				if (leftPlanPriority !== rightPlanPriority) return leftPlanPriority - rightPlanPriority;
 			}
+			if (args.preserveHealthyOrder) return left.orderPos - right.orderPos;
 			if (left.hasPriorityBoost !== right.hasPriorityBoost) return left.hasPriorityBoost ? -1 : 1;
 			if (this.#credentialRankingMode === "earliest-reset" && left.resetAtMs !== right.resetAtMs) {
 				// Earliest-expiry-first: drain the soonest-to-reset account before
@@ -3266,38 +3318,46 @@ export class AuthStorage {
 		if (credentials.length === 0) return undefined;
 
 		const providerKey = this.#getProviderTypeKey(provider, "oauth");
-		const order = selectedCredential ? [0] : this.#getCredentialOrder(providerKey, sessionId, credentials.length);
 		const strategy = this.#rankingStrategyResolver?.(provider);
 		const requiresProModel = requiresOpenAICodexProModel(provider, options?.modelId);
 		const checkUsage =
 			strategy !== undefined && (selectedCredential !== undefined || credentials.length > 1 || requiresProModel);
 		const sessionCredential = this.#getSessionCredential(provider, sessionId);
 		const sessionPreferredIndex = sessionCredential?.type === "oauth" ? sessionCredential.index : undefined;
-		// Skip ranking only when the session already has a working preferred credential — re-ranking
-		// mid-session causes account switches that cold-start the server-side prompt cache. New sessions
-		// (no preference) and sessions whose preferred is blocked still rank, so we pick the account
-		// with the most headroom proactively and fall back intelligently when rate-limited.
+		const sessionPreferredOrderIndex =
+			sessionPreferredIndex === undefined
+				? -1
+				: credentials.findIndex(entry => entry.index === sessionPreferredIndex);
+		// Keep an already-working session on its preferred credential to preserve
+		// server-side prompt cache. Fresh sessions, blocked sessions, and Pro-plan
+		// filtering start from round-robin order so concurrent sessions spread
+		// across the account pool instead of piling onto one credential. Under the
+		// default balanced ranking mode, usage data is used to block exhausted
+		// credentials, not to override healthy round-robin slot distribution.
 		const sessionPreferredIsAvailable =
-			sessionPreferredIndex !== undefined && !this.#isCredentialBlocked(providerKey, sessionPreferredIndex);
+			sessionPreferredIndex !== undefined &&
+			sessionPreferredOrderIndex >= 0 &&
+			!this.#isCredentialBlocked(providerKey, sessionPreferredIndex);
+		const order = selectedCredential
+			? [0]
+			: sessionPreferredIsAvailable && !requiresProModel
+				? this.#buildCredentialOrder(sessionPreferredOrderIndex, credentials.length)
+				: this.#getCredentialOrder(providerKey, credentials.length);
 		const shouldRank = !selectedCredential && checkUsage && (!sessionPreferredIsAvailable || requiresProModel);
 		const candidates = shouldRank
-			? await this.#rankOAuthSelections({ providerKey, provider, order, credentials, options, strategy: strategy! })
+			? await this.#rankOAuthSelections({
+					providerKey,
+					provider,
+					order,
+					credentials,
+					options,
+					strategy: strategy!,
+					preserveHealthyOrder: !requiresProModel && this.#credentialRankingMode === "balanced",
+				})
 			: order
 					.map(idx => credentials[idx])
 					.filter((selection): selection is { credential: OAuthCredential; index: number } => Boolean(selection))
 					.map(selection => ({ selection, usage: null, usageChecked: false }));
-
-		if (!selectedCredential && sessionPreferredIndex !== undefined && !requiresProModel) {
-			const sessionPreferredCandidate = candidates.findIndex(
-				candidate =>
-					!this.#isCredentialBlocked(providerKey, candidate.selection.index) &&
-					candidate.selection.index === sessionPreferredIndex,
-			);
-			if (sessionPreferredCandidate > 0) {
-				const [preferred] = candidates.splice(sessionPreferredCandidate, 1);
-				candidates.unshift(preferred);
-			}
-		}
 		await Promise.all(
 			candidates.map(async candidate => {
 				if (Date.now() + OAUTH_REFRESH_SKEW_MS < candidate.selection.credential.expires) return;
@@ -3599,6 +3659,13 @@ export class AuthStorage {
 					return undefined;
 				}
 			}
+			logger.debug("OAuth credential selected", {
+				provider,
+				index: selection.index,
+				sessionId,
+				accountId: updated.accountId,
+				email: updated.email,
+			});
 			this.#recordSessionCredential(provider, sessionId, "oauth", selection.index);
 			return { apiKey: result.apiKey, credential: updated };
 		} catch (error) {

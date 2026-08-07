@@ -244,6 +244,30 @@ describe("discoverExternalCredentials", () => {
 		expect(result.importable[0]!.origin).toBe("claude-code-file");
 	});
 
+	test("explicit keychain discovery prefers keychain over stale Claude file", async () => {
+		await writeClaude(validClaude);
+		const keychainClaude = {
+			claudeAiOauth: {
+				accessToken: "sk-ant-oat01-keychain-access-token-value",
+				refreshToken: "sk-ant-ort01-keychain-refresh-token-value",
+				expiresAt: Date.now() + 7_200_000,
+			},
+		};
+		const result = await discoverExternalCredentials({
+			homeDir,
+			env: {},
+			platform: "darwin",
+			includeClaudeKeychain: true,
+			readClaudeKeychain: async () => JSON.stringify(keychainClaude),
+		});
+		expect(result.importable).toHaveLength(1);
+		expect(result.importable[0]!.origin).toBe("claude-code-keychain");
+		expect(result.importable[0]!.credential).toMatchObject({
+			type: "oauth",
+			access: "sk-ant-oat01-keychain-access-token-value",
+		});
+	});
+
 	test("environment-backed auth is detected but not imported", async () => {
 		const result = await discoverExternalCredentials({
 			homeDir,

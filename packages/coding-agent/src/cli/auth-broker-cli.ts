@@ -250,7 +250,7 @@ async function runLogout(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	}
 }
 
-// ─── CLIProxyAPI import ─────────────────────────────────────────────────
+// ─── CLIProxyAPI / Claude token import ─────────────────────────────────────
 
 /**
  * Maps the `type` field of a CLIProxyAPI credential JSON to the gjc provider id.
@@ -269,12 +269,19 @@ interface CliProxyCredentialJson {
 	type?: string;
 	access_token?: string;
 	refresh_token?: string;
+	accessToken?: string;
+	refreshToken?: string;
 	id_token?: string;
 	expired?: string;
+	expiresAt?: number | string;
 	last_refresh?: string;
 	email?: string;
 	account_id?: string;
 	disabled?: boolean;
+}
+
+interface ClaudeTokenSidecarMeta {
+	account_hint?: string;
 }
 
 interface ImportPlanEntry {
@@ -291,6 +298,7 @@ function resolveCliProxyProvider(json: CliProxyCredentialJson, filename: string,
 	if (overrideId && overrideId.length > 0) return overrideId;
 	const typeField = json.type?.trim().toLowerCase();
 	if (typeField && CLIPROXY_TYPE_TO_PROVIDER[typeField]) return CLIPROXY_TYPE_TO_PROVIDER[typeField];
+	if (json.accessToken && json.refreshToken && path.basename(filename).endsWith(".oauth.json")) return "anthropic";
 	// Fall back to filename prefix: `<type>-<email>.json`
 	const base = path.basename(filename, ".json").toLowerCase();
 	for (const prefix in CLIPROXY_TYPE_TO_PROVIDER) {
@@ -300,12 +308,28 @@ function resolveCliProxyProvider(json: CliProxyCredentialJson, filename: string,
 	return null;
 }
 
-function parseCliProxyExpiry(raw: string | undefined): number | null {
+function parseImportExpiry(raw: string | number | undefined): number | null {
+	if (typeof raw === "number" && Number.isFinite(raw)) {
+		return raw > 10_000_000_000 ? raw : Math.round(raw * 1000);
+	}
 	if (!raw) return null;
+	const numeric = Number(raw);
+	if (Number.isFinite(numeric)) return numeric > 10_000_000_000 ? numeric : Math.round(numeric * 1000);
+	if (typeof raw !== "string") return null;
 	// CLIProxyAPI writes RFC3339-ish dates. `Date.parse` handles both `Z` and offsets.
 	const ms = Date.parse(raw);
 	if (!Number.isFinite(ms)) return null;
 	return ms;
+}
+
+async function readClaudeTokenSidecarMeta(file: string): Promise<ClaudeTokenSidecarMeta | null> {
+	if (!path.basename(file).endsWith(".oauth.json")) return null;
+	const metaPath = file.replace(/\.oauth\.json$/, ".meta");
+	try {
+		return (await Bun.file(metaPath).json()) as ClaudeTokenSidecarMeta;
+	} catch {
+		return null;
+	}
 }
 
 async function collectImportSources(target: string): Promise<string[]> {
@@ -353,21 +377,29 @@ async function loadImportPlan(
 			});
 			continue;
 		}
-		if (!json.access_token || !json.refresh_token) {
-			skipped.push({ file, reason: "missing access_token or refresh_token" });
+		const accessToken = json.access_token ?? json.accessToken;
+		const refreshToken = json.refresh_token ?? json.refreshToken;
+		if (!accessToken || !refreshToken) {
+			skipped.push({ file, reason: "missing access token or refresh token" });
 			continue;
 		}
-		const expiresAt = parseCliProxyExpiry(json.expired);
+		const expiresAt = parseImportExpiry(json.expired ?? json.expiresAt);
 		if (expiresAt === null) {
-			skipped.push({ file, reason: `cannot parse expired=${json.expired ?? "?"}` });
+			skipped.push({ file, reason: `cannot parse expiry=${json.expired ?? json.expiresAt ?? "?"}` });
 			continue;
 		}
-		const email = typeof json.email === "string" && json.email.length > 0 ? json.email : null;
+		const sidecarMeta = await readClaudeTokenSidecarMeta(file);
+		const email =
+			typeof json.email === "string" && json.email.length > 0
+				? json.email
+				: typeof sidecarMeta?.account_hint === "string" && sidecarMeta.account_hint.length > 0
+					? sidecarMeta.account_hint
+					: null;
 		const accountId = typeof json.account_id === "string" && json.account_id.length > 0 ? json.account_id : null;
 		const credential: OAuthCredential = {
 			type: "oauth",
-			access: json.access_token,
-			refresh: json.refresh_token,
+			access: accessToken,
+			refresh: refreshToken,
 			expires: expiresAt,
 			...(email !== null ? { email } : {}),
 			...(accountId !== null ? { accountId } : {}),

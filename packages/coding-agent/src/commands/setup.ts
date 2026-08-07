@@ -59,6 +59,7 @@ export default class Setup extends Command {
 		"models-path": Flags.string({ description: "Override models config path" }),
 		yes: Flags.boolean({ char: "y", description: "Import discovered credentials without an interactive prompt" }),
 		"dry-run": Flags.boolean({ description: "Preview discovered credentials without importing" }),
+		keychain: Flags.boolean({ description: "Include Claude macOS Keychain when discovering credentials" }),
 	};
 
 	async run(): Promise<void> {
@@ -93,6 +94,7 @@ export default class Setup extends Command {
 				profileDir: flags["profile-dir"],
 				yes: flags.yes,
 				dryRun: flags["dry-run"],
+				keychain: flags.keychain,
 			},
 		};
 		await initTheme();

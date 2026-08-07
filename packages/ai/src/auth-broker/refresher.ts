@@ -110,18 +110,37 @@ export class AuthBrokerRefresher {
 	}
 
 	async #refreshOne(id: number): Promise<void> {
+		const before = this.#storage.getActiveCredentialById(id);
 		try {
 			await this.#storage.refreshCredentialById(id);
 		} catch (error) {
 			const errorMsg = String(error);
-			if (isDefinitiveFailure(errorMsg)) {
-				logger.warn("auth-broker refresh failed definitively; disabling credential", {
-					id,
-					error: errorMsg,
-				});
-				this.#storage.disableCredentialById(id, `auth-broker refresh failed: ${errorMsg}`);
-			} else {
+			if (!isDefinitiveFailure(errorMsg)) {
 				logger.debug("auth-broker refresh failed (transient)", { id, error: errorMsg });
+				return;
+			}
+
+			const disabledCause = `auth-broker refresh failed: ${errorMsg}`;
+			await this.#storage.reload();
+			const latest = this.#storage.getActiveCredentialById(id);
+			if (!latest) return;
+			if (
+				before?.credential.type === "oauth" &&
+				latest.credential.type === "oauth" &&
+				before.credential.refresh !== latest.credential.refresh
+			) {
+				logger.debug("auth-broker refresh failure ignored after peer token rotation", { id });
+				return;
+			}
+
+			logger.warn("auth-broker refresh failed definitively; disabling credential", {
+				id,
+				error: errorMsg,
+			});
+			const expectedCredential = before?.credential ?? latest.credential;
+			const disabled = this.#storage.disableCredentialByIdIfMatches(id, expectedCredential, disabledCause);
+			if (!disabled) {
+				logger.debug("auth-broker refresh disable skipped after credential changed", { id });
 			}
 		}
 	}

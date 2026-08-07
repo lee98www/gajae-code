@@ -146,6 +146,46 @@ describe("AuthBrokerRefresher", () => {
 		expect(storage.exportSnapshot().credentials).toHaveLength(0);
 	});
 
+	test("does not disable a credential when another process rotated it first", async () => {
+		const now = 1_700_000_000_000;
+		store!.saveOAuth("anthropic", {
+			access: "old",
+			refresh: "old-refresh",
+			expires: now + 60_000,
+			accountId: "a",
+		});
+		const row = store!.listAuthCredentials("anthropic")[0];
+		if (!row) throw new Error("expected credential row");
+
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
+			store!.updateAuthCredential(row.id, {
+				type: "oauth",
+				access: "peer-fresh",
+				refresh: "peer-refresh",
+				expires: now + 2 * 60 * 60_000,
+				accountId: "a",
+			});
+			throw new Error("invalid_grant");
+		});
+
+		storage = new AuthStorage(store!);
+		const disableEvents: string[] = [];
+		storage.onCredentialDisabled(event => {
+			disableEvents.push(event.disabledCause);
+		});
+		await storage.reload();
+		const refresher = new AuthBrokerRefresher({
+			storage,
+			refreshSkewMs: 5 * 60_000,
+			now: () => now,
+		});
+		await refresher.tick();
+
+		expect(disableEvents).toHaveLength(0);
+		expect(storage.exportSnapshot().credentials).toHaveLength(1);
+		expect(store!.getOAuth("anthropic")?.refresh).toBe("peer-refresh");
+	});
+
 	test("keeps credentials on transient failures (timeout/network)", async () => {
 		const now = 1_700_000_000_000;
 		store!.saveOAuth("anthropic", {

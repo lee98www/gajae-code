@@ -1127,6 +1127,7 @@ describe("AgentSession resilient retry", () => {
 			requestedModels,
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const transientCredentialSpy = vi.spyOn(authStorage, "markTransientCredentialFailure");
 		const { retryStartEvents, retryEndEvents } = track(session);
 
 		await session.prompt("first-party first-event timeout");
@@ -1138,6 +1139,7 @@ describe("AgentSession resilient retry", () => {
 		expect(requestedModels).toHaveLength(4);
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(transientCredentialSpy).toHaveBeenCalledTimes(3);
 		expect(lastAssistant(session).stopReason).toBe("stop");
 	});
 	it("retries provider stream first-event timeouts under a bare default config (single model)", async () => {
@@ -1907,5 +1909,55 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(0);
 		expect(requestedModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+
+	it("soft-blocks slow successful streams so the next turn can use another account", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const slowMessage: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "slow but successful" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 10,
+				output: 180,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 190,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+			duration: 120_000,
+			ttft: 1_000,
+		};
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: slowMessage });
+					stream.push({ type: "done", reason: "stop", message: slowMessage });
+				});
+				return stream;
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxDelayMs": 10,
+			"retry.maxRetries": 1,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		const transientCredentialSpy = vi.spyOn(authStorage, "markTransientCredentialFailure").mockReturnValue(true);
+
+		await session.prompt("slow successful stream");
+		await session.waitForIdle();
+
+		expect(transientCredentialSpy).toHaveBeenCalledWith("anthropic", session.sessionId, { backoffMs: 120_000 });
 	});
 });

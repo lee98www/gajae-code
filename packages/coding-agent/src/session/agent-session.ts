@@ -991,6 +991,10 @@ function isLocalModelEndpoint(model: Model | undefined): boolean {
 }
 
 const IRC_REPLY_MAX_BYTES = 4096;
+const SLOW_STREAM_MIN_OUTPUT_TOKENS = 128;
+const SLOW_STREAM_MIN_ACTIVE_MS = 45_000;
+const SLOW_STREAM_TOKENS_PER_SECOND = 4;
+const SLOW_STREAM_CREDENTIAL_BACKOFF_MS = 2 * 60_000;
 
 export type EphemeralTurnPurpose = "btw" | "background";
 
@@ -4492,6 +4496,8 @@ export class AgentSession {
 			) {
 				await this.#modelRegistry.authStorage.remove("github-copilot");
 			}
+
+			this.#markSlowStreamCredentialIfNeeded(msg);
 
 			if (this.#skipPostTurnMaintenanceAssistantTimestamp === msg.timestamp) {
 				this.#skipPostTurnMaintenanceAssistantTimestamp = undefined;
@@ -14463,6 +14469,40 @@ export class AgentSession {
 		return classification === "transient" || classification === "unknown" || classification === "first_event_timeout";
 	}
 
+	#markSlowStreamCredentialIfNeeded(message: AssistantMessage): void {
+		if (message.stopReason === "error" || message.stopReason === "aborted") return;
+		const outputTokens = message.usage.output;
+		const durationMs = message.duration;
+		if (!Number.isFinite(outputTokens) || outputTokens < SLOW_STREAM_MIN_OUTPUT_TOKENS) return;
+		if (typeof durationMs !== "number" || !Number.isFinite(durationMs)) return;
+
+		const rawTtftMs = message.ttft;
+		const ttftMs = typeof rawTtftMs === "number" && Number.isFinite(rawTtftMs) ? Math.max(0, rawTtftMs) : 0;
+		const activeMs = Math.max(0, durationMs - ttftMs);
+		if (activeMs < SLOW_STREAM_MIN_ACTIVE_MS) return;
+
+		const tokensPerSecond = outputTokens / (activeMs / 1000);
+		if (tokensPerSecond >= SLOW_STREAM_TOKENS_PER_SECOND) return;
+
+		const switched = this.#modelRegistry.authStorage.markTransientCredentialFailure(
+			message.provider,
+			this.sessionId,
+			{
+				backoffMs: SLOW_STREAM_CREDENTIAL_BACKOFF_MS,
+			},
+		);
+		if (switched) {
+			logger.debug("Slow provider stream detected; rotating credential for next turn", {
+				provider: message.provider,
+				model: message.model,
+				outputTokens,
+				durationMs,
+				ttftMs,
+				tokensPerSecond,
+			});
+		}
+	}
+
 	#isTransientErrorMessage(errorMessage: string): boolean {
 		return (
 			this.#isTransientEnvelopeErrorMessage(errorMessage) || this.#isTransientTransportErrorMessage(errorMessage)
@@ -15136,7 +15176,7 @@ export class AgentSession {
 		const errorMessage = message.errorMessage || "Unknown error";
 		const retryAfterMs =
 			trigger.retryAfterMs ?? (managedFallback ? undefined : this.#parseRetryAfterMsFromError(errorMessage));
-		const delayMs =
+		let delayMs =
 			credentialRotated || outcome === "advance"
 				? 0
 				: managedFallback
@@ -15144,6 +15184,18 @@ export class AgentSession {
 					: retryAfterMs !== undefined
 						? Math.min(retryAfterMs, retrySettings.maxDelayMs)
 						: cappedExponentialWithFullJitter(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed);
+		if (this.model && this.#isFirstEventTimeoutErrorMessage(errorMessage)) {
+			// A first-event timeout usually means THIS credential's backend is
+			// slow or hung. Temporarily block it and clear session stickiness so
+			// the retry rotates to another account, retrying immediately when
+			// one is available instead of waiting out the backoff.
+			const switched = this.#modelRegistry.authStorage.markTransientCredentialFailure(
+				this.model.provider,
+				this.sessionId,
+				retryAfterMs === undefined ? undefined : { backoffMs: retryAfterMs },
+			);
+			if (switched) delayMs = 0;
+		}
 
 		if (managedFallback && trigger.class === "rate_limit" && trigger.retryAfterMs !== undefined && failedSelector) {
 			this.#modelRegistry.suppressSelector(failedSelector, Date.now() + trigger.retryAfterMs);

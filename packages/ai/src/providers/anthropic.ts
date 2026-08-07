@@ -101,6 +101,8 @@ import {
 import { transformMessages } from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
+const ANTHROPIC_FIRST_EVENT_TIMEOUT_MS = 300_000;
+
 export type AnthropicHeaderOptions = {
 	apiKey: string;
 	baseUrl?: string;
@@ -1543,7 +1545,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				sawTerminalStopReason = false;
 			};
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
-			const firstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
+			// LOCAL PATCH (account-distribution-timeout-rotation): keep the 300s
+			// first-event floor for every anthropic-messages stream (slow proxies /
+			// heavy reasoning), while honoring upstream's per-provider fallback.
+			const firstEventFallbackMs =
+				getProviderFirstEventTimeoutFallbackMs(model.provider) ?? ANTHROPIC_FIRST_EVENT_TIMEOUT_MS;
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
 			stream.push({ type: "start", partial: output });

@@ -98,6 +98,8 @@ export interface DiscoveryOptions {
 	 * or `null` when no entry exists.
 	 */
 	readClaudeKeychain?: () => Promise<string | null>;
+	/** Read the macOS Keychain even when the Claude file exists; explicit CLI opt-in only. */
+	includeClaudeKeychain?: boolean;
 }
 
 export type CredentialUpserter = (provider: string, credential: AuthCredential) => unknown | Promise<unknown>;
@@ -232,7 +234,7 @@ interface ResolvedExternalDir {
 
 async function discoverClaudeCode(
 	opts: Required<Pick<DiscoveryOptions, "platform">> &
-		Pick<DiscoveryOptions, "readClaudeKeychain"> & { configDir: ResolvedExternalDir },
+		Pick<DiscoveryOptions, "readClaudeKeychain" | "includeClaudeKeychain"> & { configDir: ResolvedExternalDir },
 	result: CredentialDiscoveryResult,
 ): Promise<void> {
 	const filePath = path.join(opts.configDir.dir, ".credentials.json");
@@ -249,33 +251,44 @@ async function discoverClaudeCode(
 			});
 		}
 	}
-	if (fileRaw !== null) {
-		const outcome = parseClaudeCredentials(fileRaw, "claude-code-file", `Claude Code (${displayPath})`);
-		pushOutcome(result, outcome);
-	} else if (opts.platform === "darwin") {
+
+	let keychainOutcome: ImportableCredential | SkippedCredential | null = null;
+	const shouldReadKeychain = opts.platform === "darwin" && (opts.includeClaudeKeychain === true || fileRaw === null);
+	if (shouldReadKeychain) {
 		const reader = opts.readClaudeKeychain ?? defaultClaudeKeychainReader;
 		let keychainRaw: string | null = null;
 		try {
 			keychainRaw = await reader();
 		} catch (err) {
-			result.skipped.push({
+			keychainOutcome = {
 				origin: "claude-code-keychain",
 				source: "Claude Code (macOS Keychain)",
 				reason: sanitizedFailureReason("unreadable credential file", err),
-			});
+			};
 		}
 		if (keychainRaw !== null && keychainRaw.trim().length > 0) {
-			const outcome = parseClaudeCredentials(keychainRaw, "claude-code-keychain", "Claude Code (macOS Keychain)");
-			pushOutcome(result, outcome);
+			keychainOutcome = parseClaudeCredentials(keychainRaw, "claude-code-keychain", "Claude Code (macOS Keychain)");
 		}
+	}
+
+	const keychainImportable = keychainOutcome !== null && !("reason" in keychainOutcome);
+	if (fileRaw !== null && !(opts.includeClaudeKeychain === true && keychainImportable)) {
+		const outcome = parseClaudeCredentials(fileRaw, "claude-code-file", `Claude Code (${displayPath})`);
+		pushOutcome(result, outcome);
+	}
+	if (keychainOutcome !== null) {
+		pushOutcome(result, keychainOutcome);
 	}
 }
 
 async function defaultClaudeKeychainReader(): Promise<string | null> {
-	const { $ } = await import("bun");
-	const proc = await $`security find-generic-password -s ${"Claude Code-credentials"} -w`.quiet().nothrow();
-	if (proc.exitCode !== 0) return null;
-	const out = proc.stdout.toString().trim();
+	const proc = Bun.spawn(["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+	if (exitCode !== 0) return null;
+	const out = stdout.trim();
 	return out.length > 0 ? out : null;
 }
 
@@ -437,7 +450,12 @@ export async function discoverExternalCredentials(options: DiscoveryOptions = {}
 		: resolveExternalDir("CODEX_HOME", options.env, path.join(homeDir, ".codex"), "~/.codex");
 	const result: CredentialDiscoveryResult = { importable: [], skipped: [], environment: [] };
 	await discoverClaudeCode(
-		{ configDir: claudeConfigDir, platform, readClaudeKeychain: options.readClaudeKeychain },
+		{
+			configDir: claudeConfigDir,
+			platform,
+			readClaudeKeychain: options.readClaudeKeychain,
+			includeClaudeKeychain: options.includeClaudeKeychain,
+		},
 		result,
 	);
 	await discoverCodex(codexHome, result);
