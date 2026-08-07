@@ -39,6 +39,7 @@ import { BisectTool } from "./bisect";
 import { BrowserTool } from "./browser";
 import { CalculatorTool } from "./calculator";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
+import { CwdTool } from "./cwd";
 import { ComputerTool, isComputerCallable, isComputerLoadablePlatform } from "./computer";
 import { CronTool } from "./cron";
 import { DebugTool } from "./debug";
@@ -81,6 +82,7 @@ export * from "./calculator";
 export * from "./checkpoint";
 export * from "./computer";
 export * from "./cron";
+export * from "./cwd";
 export * from "./debug";
 export * from "./eval";
 export * from "./find";
@@ -223,6 +225,8 @@ export interface AskAnswerSource {
 export interface ToolSession {
 	/** Current working directory */
 	cwd: string;
+	/** Move this session to a new working directory. */
+	moveSessionCwd?: (newCwd: string) => Promise<{ cwd: string }>;
 	/** Whether UI is available */
 	hasUI: boolean;
 	/** Whether this session will bind a workflow-gate emitter after tool construction. */
@@ -481,6 +485,7 @@ export const BUILTIN_CAPABILITY_CATALOG: readonly BuiltinCapabilityCatalogEntry[
 export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	read: s => new ReadTool(s),
 	bash: s => new BashTool(s),
+	cwd: CwdTool.createIf,
 	edit: s => new EditTool(s),
 	ast_grep: s => new AstGrepTool(s),
 	ast_edit: s => new AstEditTool(s),

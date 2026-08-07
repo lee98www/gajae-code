@@ -35,6 +35,7 @@ import {
 	logger,
 	postmortem,
 	prompt,
+	setProjectDir,
 	Snowflake,
 } from "@gajae-code/utils";
 import {
@@ -44,6 +45,7 @@ import {
 } from "../append-only-mode";
 import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "../async";
 import { loadCapability } from "../capability";
+import { reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
 import {
@@ -59,6 +61,7 @@ import { Settings, type SkillsSettings } from "../config/settings";
 import { CursorExecHandlers } from "../cursor";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import "../discovery";
+import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "../defaults/gjc-grok-cli";
@@ -1571,6 +1574,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			get cwd() {
 				return sessionManager.getCwd();
 			},
+			...(isCanonicalSubSession
+				? {}
+				: {
+						moveSessionCwd: async newCwd => {
+							await sessionManager.flush();
+							await sessionManager.moveTo(newCwd);
+							setProjectDir(newCwd);
+							clearClaudePluginRootsCache();
+							resetCapabilities();
+							return { cwd: newCwd };
+						},
+					}),
 			hasUI: options.hasUI ?? false,
 			workflowGateEligible: true,
 			enableLsp,
