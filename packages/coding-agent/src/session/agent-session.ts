@@ -14734,14 +14734,25 @@ export class AgentSession {
 		if (this.#defaultFallbackExhaustedLastTurn) {
 			this.#defaultFallbackExhaustedLastTurn = false;
 			controller.resetForNewTurn();
-			if (controller.chain.entries.length > 1) await this.#advanceDefaultFallback(controller, "new_turn", 0);
+			if (controller.chain.entries.length > 1) {
+				await this.#advanceDefaultFallback(controller, "new_turn", 0);
+			}
 			return;
 		}
-		if (
-			this.settings.get("retry.fallbackRevertPolicy") === "cooldown-expiry" &&
-			controller.activeIndex > 0 &&
-			this.#modelRegistry.getSelectorSuppressionStatus(controller.chain.entries[0] ?? "") === "expired"
-		) {
+		// Per-goal rewind to the chain head. #resetDefaultFallbackForNewTurn fires
+		// once per NEW user turn (a new ultragoal goal continuation). A prior turn
+		// may have advanced default past its head — e.g. a classifier refusal
+		// ("cyber") pushed default from the primary (fable) to a fallback (opus).
+		// Upstream only rewinds on hard exhaustion, so a single refusal otherwise
+		// pins the WHOLE multi-goal session to the fallback model and unrelated later
+		// goals run as low-quality mass production. Rewinding to the head restarts
+		// every goal on the primary; a goal whose content genuinely refuses re-advances
+		// to the fallback within its own agentic loop and stays there for that goal
+		// (no per-turn retry tax — the loop keeps the advanced index; only a NEW user
+		// turn rewinds). #ensureDefaultFallbackResolution (called right after) then
+		// re-resolves the head selector. A pre-output refusal is unbilled, so the
+		// at-most-one fable retry per refusing goal costs latency only.
+		if (controller.chain.entries.length > 1 && controller.activeIndex > 0) {
 			controller.resetForNewTurn();
 		}
 	}
