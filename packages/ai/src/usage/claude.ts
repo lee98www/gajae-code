@@ -71,6 +71,8 @@ interface ClaudeUsageResponse {
 	seven_day?: ClaudeUsageBucket | null;
 	seven_day_opus?: ClaudeUsageBucket | null;
 	seven_day_sonnet?: ClaudeUsageBucket | null;
+	/** Modern limits array; carries model-scoped weekly caps absent from the legacy fields. */
+	limits?: unknown;
 }
 
 type ClaudeUsagePayload = {
@@ -343,6 +345,46 @@ function buildUsageLimit(args: {
 	};
 }
 
+/**
+ * Parses model-scoped weekly caps out of the modern `limits[]` array.
+ *
+ * The legacy top-level buckets (five_hour / seven_day / seven_day_opus /
+ * seven_day_sonnet) do NOT include newer model-scoped weekly limits (e.g. the
+ * Fable weekly cap arrives only as `{kind: "weekly_scoped", scope: {model:
+ * {display_name: "Fable"}}}`). Dropping them makes credential ranking blind to
+ * a fully exhausted model bucket: a credential at 100% Fable-weekly still looks
+ * healthy on 5h/7d and keeps getting selected, then 429s (observed 2026-07-04).
+ */
+function parseScopedWeeklyLimits(payload: ClaudeUsageResponse): UsageLimit[] {
+	if (!Array.isArray(payload.limits)) return [];
+	const scoped: UsageLimit[] = [];
+	for (const entry of payload.limits) {
+		if (!isRecord(entry)) continue;
+		if (entry.kind !== "weekly_scoped") continue;
+		const scope = isRecord(entry.scope) ? entry.scope : undefined;
+		const model = scope && isRecord(scope.model) ? scope.model : undefined;
+		const displayName =
+			typeof model?.display_name === "string" && model.display_name.trim() ? model.display_name.trim() : undefined;
+		const tier = (displayName ?? "model").toLowerCase();
+		const bucket = parseBucket({
+			utilization: (entry as Record<string, unknown>).percent,
+			resets_at: (entry as Record<string, unknown>).resets_at,
+		});
+		const limit = buildUsageLimit({
+			id: `anthropic:7d:${tier}`,
+			label: `Claude 7 Day (${displayName ?? "Model"})`,
+			windowId: "7d",
+			windowLabel: "7 Day",
+			durationMs: SEVEN_DAYS_MS,
+			bucket,
+			provider: "anthropic",
+			tier,
+		});
+		if (limit) scoped.push(limit);
+	}
+	return scoped;
+}
+
 async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext): Promise<UsageReport | null> {
 	if (params.provider !== "anthropic") return null;
 	const credential = params.credential;
@@ -407,6 +449,10 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 		}),
 	].filter((limit): limit is UsageLimit => limit !== null);
 
+	for (const scopedLimit of parseScopedWeeklyLimits(payload)) {
+		if (!limits.some(existing => existing.id === scopedLimit.id)) limits.push(scopedLimit);
+	}
+
 	if (limits.length === 0) return null;
 	const identity = extractUsageIdentity(payload, orgId);
 	let accountId = identity.accountId ?? credential.accountId;
@@ -442,7 +488,21 @@ export const claudeUsageProvider: UsageProvider = {
 export const claudeRankingStrategy: CredentialRankingStrategy = {
 	findWindowLimits(report) {
 		const primary = report.limits.find(l => l.id === "anthropic:5h");
-		const secondary = report.limits.find(l => l.id === "anthropic:7d");
+		// A credential is only as usable as its tightest weekly bucket, so rank by
+		// the most-constrained 7d-window limit (shared 7d OR any model-scoped
+		// weekly cap). Without this, a credential whose Fable weekly sits at 100%
+		// still outranks genuinely fresh credentials because the shared 7d looks
+		// healthy, and every pick 429s until cooldowns pile up (2026-07-04).
+		let secondary = report.limits.find(l => l.id === "anthropic:7d");
+		for (const limit of report.limits) {
+			if (limit.scope.windowId !== "7d") continue;
+			const used = limit.amount.usedFraction;
+			if (typeof used !== "number" || !Number.isFinite(used)) continue;
+			const best = secondary?.amount.usedFraction;
+			if (secondary === undefined || typeof best !== "number" || !Number.isFinite(best) || used > best) {
+				secondary = limit;
+			}
+		}
 		return { primary, secondary };
 	},
 	windowDefaults: { primaryMs: 5 * 60 * 60 * 1000, secondaryMs: 7 * 24 * 60 * 60 * 1000 },
