@@ -546,6 +546,40 @@ describe("AgentSession resilient retry", () => {
 		}
 	});
 
+	it("routes a provider refusal to a configured fallback model instead of surfacing", async () => {
+		// A cyber/safety refusal is deterministic for the same model, but a
+		// switch to a configured fallback model (a different model, not a
+		// re-send) can succeed. With a multi-entry modelRoles.default chain
+		// routes through the model-fallback path and recovers on the fallback
+		// instead of terminally killing the turn (#1655 covers only same-model
+		// re-send, not a model switch).
+		const requestedModels: string[] = [];
+		session = buildSession({
+			responses: [
+				{
+					throw: "Refusal (cyber): This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy.",
+				},
+				{ content: ["recovered on fallback model"] },
+			],
+			requestedModels,
+		});
+		session.setConfiguredModelChain(
+			"default",
+			["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-5"],
+			"modelRoles",
+		);
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("refusal with a fallback chain configured");
+		await session.waitForIdle();
+
+		expect(retryStartEvents.length).toBeGreaterThanOrEqual(1);
+		expect(lastAssistant(session).stopReason).toBe("stop");
+		// The recovery request went to the fallback model, not the refusing primary.
+		expect(requestedModels.at(-1)).toBe("anthropic/claude-opus-4-5");
+	});
+
 	it("retries errors that merely mention legacy safety-stop labels mid-sentence", async () => {
 		const incidentalMessages = [
 			"connection error after upstream refusal handshake",

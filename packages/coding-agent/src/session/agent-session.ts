@@ -880,6 +880,7 @@ type RetryErrorClassification =
 	| "first_event_timeout"
 	| "transient"
 	| "local_unavailable"
+	| "refusal_fallback"
 	| "unknown";
 
 const BARE_DEFAULT_WATCHDOG_ERROR =
@@ -14466,7 +14467,22 @@ export class AgentSession {
 			return true;
 		}
 		const classification = this.#classifyErrorForRetry(message);
-		return classification === "transient" || classification === "unknown" || classification === "first_event_timeout";
+		return (
+			classification === "transient" ||
+			classification === "unknown" ||
+			classification === "first_event_timeout" ||
+			classification === "refusal_fallback"
+		);
+	}
+
+	#classifyProviderSafetyStop(): RetryErrorClassification {
+		// A provider content refusal is deterministic for the same model +
+		// context (#1655): re-sending the identical conversation to the SAME
+		// model always re-refuses. Switching to a configured fallback model is
+		// a different model (not a re-send), so it can succeed — route to the
+		// model-fallback path when another chain entry exists, else terminal.
+		const controller = this.#defaultFallbackChain();
+		return controller.chain.entries.length > 1 && !controller.isExhausted() ? "refusal_fallback" : "terminal";
 	}
 
 	#markSlowStreamCredentialIfNeeded(message: AssistantMessage): void {
@@ -14586,7 +14602,7 @@ export class AgentSession {
 	 */
 	#classifyErrorForRetry(message: AssistantMessage): RetryErrorClassification {
 		if (message.stopReason !== "error") return "none";
-		if (message.errorKind === "provider_safety_stop") return "terminal";
+		if (message.errorKind === "provider_safety_stop") return this.#classifyProviderSafetyStop();
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
 		if (!message.errorMessage) return "none";
 		const err = message.errorMessage;
@@ -14596,7 +14612,7 @@ export class AgentSession {
 		// auto-retry loop can never succeed and only re-bills the full context
 		// on every attempt (#1655). Surface immediately instead of entering the
 		// bounded unknown retry class.
-		if (isLegacyProviderSafetyStopMessage(err)) return "terminal";
+		if (isLegacyProviderSafetyStopMessage(err)) return this.#classifyProviderSafetyStop();
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (classifyContextOverflow(message, message.transportFailure, contextWindow)) return "overflow";
 		if (isLocalModelEndpoint(this.model) && this.#isLocalProviderAvailabilityErrorMessage(err)) {
@@ -14893,7 +14909,11 @@ export class AgentSession {
 		if (allowLegacyUsageLimit && classification === "usage_limit") {
 			return { class: "quota" };
 		}
-		if (classification === "transient" || classification === "first_event_timeout") {
+		if (
+			classification === "transient" ||
+			classification === "first_event_timeout" ||
+			classification === "refusal_fallback"
+		) {
 			return { class: "server" };
 		}
 		if (classification === "unknown") return { class: "unknown" };
@@ -15134,12 +15154,18 @@ export class AgentSession {
 		}
 		const legacyUnbounded = !managedFallback && classification === "transient";
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
+		const refusalFallback = managedFallback && this.#classifyErrorForRetry(message) === "refusal_fallback";
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome = managedFallback
 			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
 			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
 				? "retry"
 				: "exhausted";
+		if (refusalFallback && outcome === "retry") {
+			// Never re-send the identical context to the refusing model
+			// (deterministic re-refusal, #1655) — advance the chain instead.
+			outcome = controller.advance() ? "advance" : "exhausted";
+		}
 		// Credential rotation is unbounded: a fresh credential is a different
 		// retry dimension from transient-error backoff, so it overrides maxRetries
 		// exhaustion and forces an immediate same-model retry.
