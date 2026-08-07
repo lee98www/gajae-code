@@ -2065,11 +2065,60 @@ function destinationFor(
 // =============================================================================
 
 /**
+ * Publish a cmux native session-restore record for this session (best effort).
+ *
+ * cmux registers gjc as a custom vault agent (cmux.json `vault.agents[id=gjc]`)
+ * and, on relaunch, reads `~/.cmuxterm/gjc-hook-sessions.json` to run
+ * `gjc --resume {{sessionPath}}` inside each restored terminal surface. This is
+ * the producer side of that contract: keyed by the CMUX_SURFACE_ID env var so
+ * concurrent panels sharing one cwd map back to their exact sessions (tty and
+ * title are not stable across relaunch; the surface UUID is).
+ *
+ * The record shape must stay in sync with cmux's RestorableAgentHookSessionRecord
+ * (see also `write_cmux_hook_store()` in the external cmux-gjc-restore tool).
+ * No-op outside cmux. Never throws into session persistence.
+ */
+function writeCmuxHookRecord(cwd: string, sessionFile: string): void {
+	const surface = process.env.CMUX_SURFACE_ID || process.env.CMUX_PANEL_ID;
+	if (!surface) return;
+	void (async () => {
+		try {
+			const storeDir = process.env.CMUX_AGENT_HOOK_STATE_DIR || path.join(os.homedir(), ".cmuxterm");
+			const storePath = path.join(storeDir, "gjc-hook-sessions.json");
+			let store: { version?: number; sessions?: Record<string, unknown> } = {};
+			try {
+				store = JSON.parse(await Bun.file(storePath).text());
+			} catch {
+				// Missing or corrupt store — start fresh.
+			}
+			const sessions: Record<string, unknown> =
+				store.sessions && typeof store.sessions === "object" ? store.sessions : {};
+			sessions[surface] = {
+				sessionId: path.resolve(sessionFile),
+				workspaceId: process.env.CMUX_WORKSPACE_ID ?? "",
+				surfaceId: surface,
+				cwd,
+				pid: process.pid,
+				isRestorable: true,
+				updatedAt: Date.now() / 1000,
+			};
+			await fs.promises.mkdir(storeDir, { recursive: true });
+			const tmpPath = `${storePath}.${process.pid}.tmp`;
+			await Bun.write(tmpPath, JSON.stringify({ version: store.version ?? 1, sessions }));
+			await fs.promises.rename(tmpPath, storePath);
+		} catch {
+			// Best-effort — never break session persistence over resume bookkeeping.
+		}
+	})();
+}
+
+/**
  * Write a breadcrumb linking the current terminal to a session file.
  * The breadcrumb contains the cwd and session path so --continue can
  * find "this terminal's last session" even when running concurrent instances.
  */
 function writeTerminalBreadcrumb(cwd: string, sessionFile: string): void {
+	writeCmuxHookRecord(cwd, sessionFile);
 	const terminalId = getTerminalId();
 	if (!terminalId) return;
 
