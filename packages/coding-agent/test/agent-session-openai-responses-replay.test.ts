@@ -729,6 +729,9 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 				} as unknown as AgentSession["sessionManager"],
 				getActiveToolNames: () => ["yield"],
 				setActiveToolsByName: async () => {},
+				updateActiveToolsByName: async (update: (current: string[]) => string[] | undefined) => {
+					update([]);
+				},
 				subscribe: ((listener: (typeof listeners)[number]) => {
 					listeners.push(listener);
 					return () => {

@@ -74,6 +74,9 @@ function createMockSession(
 		},
 		getActiveToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_toolNames: string[]) => {},
+		updateActiveToolsByName: async (update: (current: string[]) => string[]) => {
+			update(["read", "yield"]);
+		},
 		setConfiguredModelChain: () => {},
 		seedDefaultFallbackResolution: () => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {

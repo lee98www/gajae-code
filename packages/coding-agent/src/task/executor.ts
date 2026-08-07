@@ -1763,12 +1763,16 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				});
 			}
 
-			const subagentToolNames = session.getActiveToolNames();
 			const parentOwnedToolNames = new Set(["todo_write"]);
-			const filteredSubagentTools = subagentToolNames.filter(name => !parentOwnedToolNames.has(name));
-			if (filteredSubagentTools.length !== subagentToolNames.length) {
-				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
-			}
+			await awaitAbortable(
+				session.updateActiveToolsByName(
+					active =>
+						active.some(name => parentOwnedToolNames.has(name))
+							? active.filter(name => !parentOwnedToolNames.has(name))
+							: undefined,
+					"task:remove-parent-owned-tools",
+				),
+			);
 
 			session.sessionManager.appendSessionInit({
 				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),

@@ -6,7 +6,9 @@ import type { AgentToolContext } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import * as z from "zod/v4";
 import { Settings } from "../src/config/settings";
+import type { CustomTool } from "../src/extensibility/custom-tools/types";
 import { createDeepInterviewIntentManifest } from "../src/gjc-runtime/deep-interview-state";
 import { activeEntryPath, modeStatePath, sessionStateDir } from "../src/gjc-runtime/session-layout";
 import {
@@ -195,7 +197,76 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			};
 
 			session.setWorkflowGateEmitter(emitter);
+			await session.workflowGateToolRestoration;
 
+			expect(session.getActiveToolNames()).toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("recovers ask readiness after an earlier attachment rebuild rejects", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-ask-recovery-"));
+		tempDirs.push(tempDir);
+		const tripwire: CustomTool = {
+			name: "rebuild_tripwire",
+			label: "rebuild_tripwire",
+			description: "Rebuild tripwire",
+			parameters: z.object({}),
+			async execute() {
+				return { content: [{ type: "text", text: "ok" }] };
+			},
+		};
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			toolNames: [tripwire.name],
+			customTools: [tripwire],
+		});
+		try {
+			let rejectRebuild = false;
+			const registeredTripwire = session.getToolByName(tripwire.name);
+			if (!registeredTripwire) throw new Error("Expected rebuild tripwire to be registered");
+			Object.defineProperty(registeredTripwire, "description", {
+				configurable: true,
+				get: () => {
+					if (rejectRebuild) throw new Error("injected ask attachment rebuild failure");
+					return "Rebuild tripwire";
+				},
+			});
+			const pendingGate: WorkflowGate = {
+				type: "workflow_gate",
+				gate_id: "pending-gate-recovery",
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string" },
+				schema_hash: "test",
+				context: {},
+				created_at: new Date().toISOString(),
+				required: true,
+			};
+			const emitter: WorkflowGateEmitter = {
+				supportsRemoteGateAnswers: () => true,
+				emitGate: () => Promise.resolve(undefined),
+				listPendingGates: () => [pendingGate],
+			};
+
+			rejectRebuild = true;
+			session.setWorkflowGateEmitter(emitter);
+			await expect(session.workflowGateToolRestoration).rejects.toThrow("injected ask attachment rebuild failure");
+			expect(session.getActiveToolNames()).not.toContain("ask");
+
+			rejectRebuild = false;
+			session.setWorkflowGateEmitter(emitter);
+			await session.workflowGateToolRestoration;
 			expect(session.getActiveToolNames()).toContain("ask");
 		} finally {
 			await session.dispose();
@@ -227,6 +298,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			};
 
 			expect(() => session.setWorkflowGateEmitter(emitter)).not.toThrow();
+			await session.workflowGateToolRestoration;
 			expect(session.getToolByName("ask")).toBeDefined();
 			expect(session.getActiveToolNames()).toContain("ask");
 		} finally {
@@ -266,6 +338,57 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			for (let attempt = 0; attempt < 20 && !session.getActiveToolNames().includes("ask"); attempt += 1)
 				await Bun.sleep(1);
 			expect(session.getActiveToolNames()).toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("propagates canonical skill ask-attachment failures before best-effort state sync", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-skill-ask-failure-"));
+		tempDirs.push(tempDir);
+		const tripwire: CustomTool = {
+			name: "skill_rebuild_tripwire",
+			label: "skill_rebuild_tripwire",
+			description: "Skill rebuild tripwire",
+			parameters: z.object({}),
+			async execute() {
+				return { content: [{ type: "text", text: "ok" }] };
+			},
+		};
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			toolNames: [tripwire.name],
+			customTools: [tripwire],
+		});
+		try {
+			const registeredTripwire = session.getToolByName(tripwire.name);
+			if (!registeredTripwire) throw new Error("Expected skill rebuild tripwire to be registered");
+			Object.defineProperty(registeredTripwire, "description", {
+				configurable: true,
+				get: () => {
+					throw new Error("injected canonical skill ask failure");
+				},
+			});
+
+			await expect(
+				session.promptCustomMessage({
+					customType: SKILL_PROMPT_MESSAGE_TYPE,
+					content: "# Ultragoal",
+					display: true,
+					details: { name: "ultragoal" },
+					attribution: "agent",
+				}),
+			).rejects.toThrow("injected canonical skill ask failure");
+			expect(session.getActiveToolNames()).not.toContain("ask");
 		} finally {
 			await session.dispose();
 		}

@@ -330,6 +330,9 @@ describe("rlm preset tool boundary", () => {
 			setActiveToolsByName: async (toolNames: string[]) => {
 				activeToolNames = toolNames;
 			},
+			updateActiveToolsByName: async (update: (current: string[]) => string[]) => {
+				activeToolNames = update([...activeToolNames]);
+			},
 			getGoalModeState: () => goalState,
 			goalRuntime: {
 				createGoal: async ({ objective }: { objective: string }) => {
@@ -359,6 +362,7 @@ describe("rlm preset tool boundary", () => {
 			preset.onSessionCreated?.({
 				getActiveToolNames: () => ["python", "read", "bash", "goal", "edit"],
 				setActiveToolsByName: async () => {},
+				updateActiveToolsByName: async () => {},
 				getGoalModeState: () => goalState,
 				goalRuntime: { createGoal: async () => goalState, resumeGoal: async () => goalState },
 			} as never),

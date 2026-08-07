@@ -42,6 +42,21 @@ export function createDiscoverableTool(
 	};
 }
 
+/**
+ * Real MCP bridge-shaped discoverable tool: `mcp__` name PLUS non-empty
+ * mcpServerName/mcpToolName, which is what `isMCPBridgeTool` requires for the
+ * session to treat it as MCP-discoverable rather than a builtin discoverable.
+ */
+export function createMcpDiscoverableTool(serverName: string, mcpToolName: string): AgentTool {
+	const name = `mcp__${serverName}_${mcpToolName}`;
+	return {
+		...createDiscoverableTool(name),
+		label: `${serverName}/${mcpToolName}`,
+		mcpServerName: serverName,
+		mcpToolName,
+	} as AgentTool;
+}
+
 export function createResidentSearchTool(): AgentTool {
 	return { ...createDiscoverableTool("search_tool_bm25"), loadMode: "essential" };
 }
@@ -54,6 +69,12 @@ export function createResidentSearchTool(): AgentTool {
 export function createDiscoverySession(
 	tools: AgentTool[],
 	rebuildCounter?: RebuildCounter,
+	options?: {
+		/** Invoked before each rebuild; throw to simulate a rebuild failure. May be async to hold the lock. */
+		onRebuild?: (toolNames: string[]) => void | Promise<void>;
+		/** Enable MCP discovery so `mcp__` bridge tools take the MCP selection path. */
+		mcpDiscoveryEnabled?: boolean;
+	},
 ): { session: AgentSession; toolRegistry: Map<string, AgentTool> } {
 	const residentSearchTool = createResidentSearchTool();
 	const toolRegistry = new Map<string, AgentTool>([
@@ -74,7 +95,9 @@ export function createDiscoverySession(
 		settings: Settings.isolated({ "tools.discoveryMode": "all" }),
 		modelRegistry: {} as never,
 		toolRegistry,
+		...(options?.mcpDiscoveryEnabled ? { mcpDiscoveryEnabled: true } : {}),
 		rebuildSystemPrompt: async toolNames => {
+			await options?.onRebuild?.(toolNames);
 			if (rebuildCounter) rebuildCounter.count += 1;
 			return { systemPrompt: [`tools:${toolNames.join(",")}`] };
 		},

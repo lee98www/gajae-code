@@ -270,13 +270,16 @@ describe("InteractiveMode goal mode integration", () => {
 		await goalTool.execute("call-id", { op: "complete" });
 
 		// completeGoalFromTool sets state.mode="exiting". The deferred completed-exit
-		// runs at the next getUserInput() (interactive-mode.ts:623-625) BEFORE the
-		// promise awaits the input callback, so we drain state, then resolve the
-		// input callback to release the promise.
+		// runs at the next getUserInput() BEFORE the promise awaits the input
+		// callback, so wait for the callback itself to be installed. Waiting on
+		// goal state instead is racy: the exit clears state before getUserInput
+		// resumes, and it does not even await a tool apply when the goal tool was
+		// already active (mode-owned removal is a no-op there).
 		const nextTurn = harness.mode.getUserInput();
-		for (let i = 0; i < 100 && harness.session.getGoalModeState() !== undefined; i++) {
+		for (let i = 0; i < 100 && !harness.mode.onInputCallback; i++) {
 			await Bun.sleep(0);
 		}
+		expect(harness.session.getGoalModeState()).toBeUndefined();
 		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "next turn" }));
 		await nextTurn;
 

@@ -54,6 +54,9 @@ function createYieldingSession(): AgentSession {
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => ["yield"],
 		setActiveToolsByName: async () => {},
+		updateActiveToolsByName: async (update: (current: string[]) => string[] | undefined) => {
+			update([]);
+		},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
 			return () => {

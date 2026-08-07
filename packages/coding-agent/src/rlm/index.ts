@@ -167,7 +167,10 @@ async function ensureRlmGoalMode(session: AgentSession, objective: string): Prom
 	} else {
 		await session.goalRuntime.createGoal({ objective });
 	}
-	await session.setActiveToolsByName([...new Set([...session.getActiveToolNames().filter(isRlmToolAllowed), "goal"])]);
+	await session.updateActiveToolsByName(
+		active => [...new Set([...active.filter(isRlmToolAllowed), "goal"])],
+		"rlm:enter-goal-mode",
+	);
 }
 
 export function buildRlmGoalObjective(input: {

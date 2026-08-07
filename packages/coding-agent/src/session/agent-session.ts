@@ -2120,7 +2120,7 @@ export class AgentSession {
 	 * the dominant cause of prompt-cache invalidation in long sessions.
 	 */
 	#lastAppliedToolSignature: string | undefined;
-	#pendingAppliedToolSignature: string | undefined;
+	#applyToolsQueue: Promise<void> = Promise.resolve();
 	#baseSystemPromptGeneration = 0;
 	#pendingBaseSystemPromptRebuilds = new Set<Promise<void>>();
 	#mcpDiscoveryEnabled = false;
@@ -6749,7 +6749,21 @@ export class AgentSession {
 		return { epoch: this.#discoveredToolEpoch, reason: this.#discoveredToolEpochReason };
 	}
 
+	/**
+	 * Activate discoverable tools. Runs on the shared apply queue so the cap
+	 * checks, the selection snapshot, and the prompt rebuild are one atomic
+	 * step: two concurrent batches are ordered, and the second observes the
+	 * first's selections when enforcing N/byte/token caps (a pre-queue check
+	 * would let 5+5 concurrent activations exceed the cap after merging).
+	 */
 	async activateDiscoveredTools(toolNames: string[]): Promise<string[]> {
+		return await this.#runOnApplyQueue(() => this.#activateDiscoveredToolsLocked(toolNames));
+	}
+
+	async #activateDiscoveredToolsLocked(toolNames: string[]): Promise<string[]> {
+		// A queued link can reach the head after dispose(); do not mutate or
+		// persist onto a flushed session.
+		if (this.#isDisposed) return [];
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
 		const previousSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
 		const nextActiveToolNames = this.getActiveToolNames();
@@ -6823,7 +6837,7 @@ export class AgentSession {
 			return [];
 		}
 
-		await this.#applyActiveToolsByName(nextActiveToolNames, {
+		await this.#applyActiveToolsByNameLocked(nextActiveToolNames, {
 			previousSelectedMCPToolNames,
 			previousSelectedDiscoveredBuiltinToolNames,
 			nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
@@ -7016,7 +7030,46 @@ export class AgentSession {
 		this.agent.setTools(tools.map(tool => this.#prepareToolForExecution(tool)));
 	}
 
+	/**
+	 * Serialized entry point for every active-tool mutation. The whole locked
+	 * body (snapshot, signature, epoch, rebuild, guarded-tool install) runs
+	 * mutually exclusively, so interleaved callers cannot double-charge the
+	 * epoch or lose a previous caller's tools to a stale pre-await snapshot.
+	 * A failed link never poisons the queue, and each caller observes only its
+	 * own error.
+	 *
+	 * `toolNames` accepts a thunk so a caller whose desired set is derived from
+	 * current session state (e.g. `[...getActiveToolNames(), extra]`) can defer
+	 * that read INTO the lock. A pre-lock snapshot would otherwise let a stale
+	 * full-list replacement silently drop a preceding activation's tools.
+	 */
+	#runOnApplyQueue<T>(task: () => Promise<T>): Promise<T> {
+		const run = this.#applyToolsQueue.then(task, task);
+		// Keep the queue settled-but-never-rejected so a caller's failure does
+		// not surface as an unhandled rejection on the shared chain.
+		this.#applyToolsQueue = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		return run;
+	}
+
 	async #applyActiveToolsByName(
+		toolNames: string[] | (() => string[]),
+		options?: {
+			persistMCPSelection?: boolean;
+			previousSelectedMCPToolNames?: string[];
+			previousSelectedDiscoveredBuiltinToolNames?: string[];
+			nextSelectedDiscoveredBuiltinToolNames?: string[];
+			discoveredToolEpochReason?: string;
+		},
+	): Promise<void> {
+		await this.#runOnApplyQueue(() =>
+			this.#applyActiveToolsByNameLocked(typeof toolNames === "function" ? toolNames() : toolNames, options),
+		);
+	}
+
+	async #applyActiveToolsByNameLocked(
 		toolNames: string[],
 		options?: {
 			persistMCPSelection?: boolean;
@@ -7026,6 +7079,7 @@ export class AgentSession {
 			discoveredToolEpochReason?: string;
 		},
 	): Promise<void> {
+		if (this.#isDisposed) return;
 		toolNames = [...new Set([...toolNames.map(name => name.toLowerCase()), ...this.#mandatoryMCPToolNames])];
 		const previousSelectedMCPToolNames = options?.previousSelectedMCPToolNames ?? this.getSelectedMCPToolNames();
 		const previousSelectedDiscoveredBuiltinToolNames =
@@ -7060,39 +7114,30 @@ export class AgentSession {
 			}
 		}
 		const signature = this.#computeAppliedToolSignature(validToolNames, tools);
-		const promptRelevantToolsChanged =
-			signature !== (this.#pendingAppliedToolSignature ?? this.#lastAppliedToolSignature);
-		if (promptRelevantToolsChanged) {
+		const promptRelevantToolsChanged = signature !== this.#lastAppliedToolSignature;
+		const bumpDiscoveredToolEpoch = () => {
 			this.#discoveredToolEpoch++;
 			this.#discoveredToolEpochReason = options?.discoveredToolEpochReason ?? "tool-set-change";
-		}
+		};
 		if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
 			const generation = this.#reserveBaseSystemPromptGeneration();
-			try {
-				const built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
-					this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
-				);
-				if (this.#isDisposed) {
-					if (generation === this.#baseSystemPromptGeneration) {
-						this.#pendingAppliedToolSignature = undefined;
-					}
-					return;
-				}
-				if (generation === this.#baseSystemPromptGeneration) {
-					this.#baseSystemPrompt = built.systemPrompt;
-					this.agent.setSystemPrompt(this.#baseSystemPrompt);
-					this.#lastAppliedToolSignature = signature;
-					this.#pendingAppliedToolSignature = undefined;
-				}
-			} catch (error) {
-				if (generation === this.#baseSystemPromptGeneration) {
-					this.#pendingAppliedToolSignature = undefined;
-				}
-				throw error;
+			// Bump the epoch only after the rebuild succeeds: a failed apply must not
+			// leave an epoch/reason describing tools that never became active.
+			const built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
+				this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
+			);
+			// Re-check disposal: dispose() can land while the rebuild is in flight,
+			// and a resumed link must not write onto a flushed session.
+			if (this.#isDisposed) return;
+			if (generation === this.#baseSystemPromptGeneration) {
+				this.#baseSystemPrompt = built.systemPrompt;
+				this.agent.setSystemPrompt(this.#baseSystemPrompt);
+				this.#lastAppliedToolSignature = signature;
 			}
+			bumpDiscoveredToolEpoch();
 		} else if (promptRelevantToolsChanged) {
 			this.#lastAppliedToolSignature = signature;
-			this.#pendingAppliedToolSignature = undefined;
+			bumpDiscoveredToolEpoch();
 		}
 		if (promptRelevantToolsChanged) this.#defaultModelSelectionMutationRevision++;
 		this.#selectedMCPToolNames = nextSelectedMCPToolNames;
@@ -7139,11 +7184,18 @@ export class AgentSession {
 			this.#selectedDiscoveredToolNames.delete("ssh");
 		}
 
-		const nextActive = previousActiveToolNames.filter(name => name !== "ssh" && this.#toolRegistry.has(name));
-		if (refreshedTool && sshAllowed && (wasActive || (options?.activateIfAvailable && !hadSshTool))) {
-			nextActive.push(refreshedTool.name);
-		}
-		await this.#applyActiveToolsByName(nextActive, { discoveredToolEpochReason: "refresh:ssh" });
+		// Snapshot inside the lock: a concurrent activation committed between this
+		// refresh and its turn must not be dropped by a stale full-list replacement.
+		await this.#applyActiveToolsByName(
+			() => {
+				const nextActive = this.getActiveToolNames().filter(name => name !== "ssh" && this.#toolRegistry.has(name));
+				if (refreshedTool && sshAllowed && (wasActive || (options?.activateIfAvailable && !hadSshTool))) {
+					nextActive.push(refreshedTool.name);
+				}
+				return nextActive;
+			},
+			{ discoveredToolEpochReason: "refresh:ssh" },
+		);
 	}
 
 	/**
@@ -7154,9 +7206,49 @@ export class AgentSession {
 	 *
 	 * Explicit user selection remains unrestricted; discoverable-tool caps apply
 	 * only to activateDiscoveredTools.
+	 *
+	 * Concurrency: the caller's list is authoritative for what it names, but a
+	 * discovery activation that COMMITS after the caller built its list (and
+	 * before this call reaches the head of the apply queue) is preserved rather
+	 * than silently dropped. Without this, a stale full-list replacement racing
+	 * an accepted activation would report the tool as activated while removing
+	 * it from the agent. To deselect a discovered tool explicitly, pass a list
+	 * that omits it after awaiting any in-flight activation.
 	 */
 	async setActiveToolsByName(toolNames: string[]): Promise<void> {
-		await this.#applyActiveToolsByName(toolNames, { discoveredToolEpochReason: "set-active-tools" });
+		const requested = new Set(toolNames.map(name => name.toLowerCase()));
+		// Union accessor: MCP-discoverable activations never appear in the builtin
+		// selection set, so using the builtin-only accessor here would leave the
+		// same drop-tools race open for MCP tools.
+		const selectedBeforeQueue = new Set(this.getSelectedDiscoveredToolNames());
+		await this.#applyActiveToolsByName(
+			() => {
+				// Preserve only discovered selections that appeared while this call
+				// waited, i.e. names the caller could not have known to include.
+				const committedSinceSnapshot = this.getSelectedDiscoveredToolNames().filter(
+					name => !selectedBeforeQueue.has(name) && !requested.has(name.toLowerCase()),
+				);
+				return [...toolNames, ...committedSinceSnapshot];
+			},
+			{ discoveredToolEpochReason: "set-active-tools" },
+		);
+	}
+
+	/**
+	 * Atomically derive a replacement active-tool set from the latest committed
+	 * state. Controller read-modify-write paths must use this instead of taking a
+	 * pre-await snapshot with `getActiveToolNames()`. Returning `undefined` skips
+	 * the apply entirely, preserving cache/signature state for a true no-op.
+	 */
+	async updateActiveToolsByName(update: (current: string[]) => string[] | undefined, reason: string): Promise<void> {
+		await this.#runOnApplyQueue(async () => {
+			if (this.#isDisposed) return;
+			const next = update([...this.getActiveToolNames()]);
+			if (!next) return;
+			await this.#applyActiveToolsByNameLocked(next, {
+				discoveredToolEpochReason: reason || "update-active-tools",
+			});
+		});
 	}
 
 	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
@@ -7190,21 +7282,18 @@ export class AgentSession {
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
 		if (!this.#rebuildSystemPrompt) return;
+		await this.#runOnApplyQueue(() => this.#refreshBaseSystemPromptLocked());
+	}
+
+	async #refreshBaseSystemPromptLocked(): Promise<void> {
+		if (!this.#rebuildSystemPrompt || this.#isDisposed) return;
 		const activeToolNames = this.getActiveToolNames();
 		const generation = this.#reserveBaseSystemPromptGeneration();
 		this.#defaultModelSelectionMutationRevision++;
-		let built: { systemPrompt: string[] };
-		try {
-			built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
-				this.#rebuildSystemPrompt!(activeToolNames, this.#toolRegistry),
-			);
-		} catch (error) {
-			if (generation === this.#baseSystemPromptGeneration) {
-				this.#pendingAppliedToolSignature = undefined;
-			}
-			throw error;
-		}
-		if (generation !== this.#baseSystemPromptGeneration) return;
+		const built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
+			this.#rebuildSystemPrompt!(activeToolNames, this.#toolRegistry),
+		);
+		if (this.#isDisposed || generation !== this.#baseSystemPromptGeneration) return;
 		this.#baseSystemPrompt = built.systemPrompt;
 		this.agent.setSystemPrompt(this.#baseSystemPrompt);
 		// Refresh the cached signature so a subsequent `#applyActiveToolsByName` with
@@ -7214,7 +7303,6 @@ export class AgentSession {
 			.map(name => this.#toolRegistry.get(name))
 			.filter((tool): tool is AgentTool => tool != null);
 		this.#lastAppliedToolSignature = this.#computeAppliedToolSignature(activeToolNames, activeTools);
-		this.#pendingAppliedToolSignature = undefined;
 	}
 
 	async #buildSystemPromptForAgentStart(promptText: string): Promise<string[]> {
@@ -7339,11 +7427,10 @@ export class AgentSession {
 				this.#resolveConstructorMCPToolSelection() ?? this.#getConfiguredDefaultSelectedMCPToolNames(),
 			);
 		}
-		const nextActive = [...this.#getActiveNonMCPToolNames(), ...this.getSelectedMCPToolNames()];
-		await this.#applyActiveToolsByName(nextActive, {
-			previousSelectedMCPToolNames,
-			persistMCPSelection: hasPersistedMCPToolSelection,
-		});
+		await this.#applyActiveToolsByName(
+			() => [...this.#getActiveNonMCPToolNames(), ...this.getSelectedMCPToolNames()],
+			{ previousSelectedMCPToolNames, persistMCPSelection: hasPersistedMCPToolSelection },
+		);
 	}
 
 	async #hasActiveGjcSubskillTools(parent: string, sessionId: string | undefined): Promise<boolean> {
@@ -7390,14 +7477,13 @@ export class AgentSession {
 		if (!parent) {
 			if (this.#gjcSubskillToolNames.size === 0) return;
 			const previousGjcSubskillToolNames = new Set(this.#gjcSubskillToolNames);
-			const previousActiveToolNames = this.getActiveToolNames();
 			for (const name of previousGjcSubskillToolNames) {
 				this.#toolRegistry.delete(name);
 			}
 			this.#gjcSubskillToolNames.clear();
 			this.#invalidateDiscoveryCaches();
-			await this.#applyActiveToolsByName(
-				previousActiveToolNames.filter(name => !previousGjcSubskillToolNames.has(name)),
+			await this.#applyActiveToolsByName(() =>
+				this.getActiveToolNames().filter(name => !previousGjcSubskillToolNames.has(name)),
 			);
 			return;
 		}
@@ -7424,7 +7510,6 @@ export class AgentSession {
 			return;
 		}
 
-		const previousActiveToolNames = this.getActiveToolNames();
 		for (const name of previousGjcSubskillToolNames) {
 			this.#toolRegistry.delete(name);
 		}
@@ -7443,24 +7528,23 @@ export class AgentSession {
 		this.#gjcSubskillToolSignature = nextSignature;
 
 		this.#invalidateDiscoveryCaches();
-		const activeNonGjcSubskillToolNames = previousActiveToolNames.filter(
-			name => !previousGjcSubskillToolNames.has(name),
-		);
-		const preservedGjcSubskillToolNames = previousActiveToolNames.filter(
-			name => previousGjcSubskillToolNames.has(name) && this.#gjcSubskillToolNames.has(name),
-		);
 		const autoActivatedGjcSubskillToolNames = customTools
 			.filter(tool => !tool.hidden && !previousGjcSubskillToolNames.has(tool.name))
 			.map(tool => tool.name);
-		await this.#applyActiveToolsByName(
-			Array.from(
+		// Snapshot inside the lock so a concurrently committed activation is not
+		// dropped by this stale full-list replacement.
+		await this.#applyActiveToolsByName(() => {
+			const activeNames = this.getActiveToolNames();
+			return Array.from(
 				new Set([
-					...activeNonGjcSubskillToolNames,
-					...preservedGjcSubskillToolNames,
+					...activeNames.filter(name => !previousGjcSubskillToolNames.has(name)),
+					...activeNames.filter(
+						name => previousGjcSubskillToolNames.has(name) && this.#gjcSubskillToolNames.has(name),
+					),
 					...autoActivatedGjcSubskillToolNames,
 				]),
-			),
-		);
+			);
+		});
 	}
 
 	/** Whether auto-compaction is currently running */
@@ -8021,17 +8105,25 @@ export class AgentSession {
 		this.#workflowGateEmitter = emitter;
 		notifyWorkflowGateEmitterChanged(this.sessionId, emitter);
 		if (emitter) {
-			this.#registerWorkflowGateAskTool();
+			const attachment = this.#registerWorkflowGateAskTool();
+			if (attachment) {
+				const priorRestoration = this.#workflowGateToolRestoration;
+				this.#workflowGateToolRestoration = priorRestoration.then(
+					() => attachment,
+					() => attachment,
+				);
+				this.#workflowGateToolRestoration.catch(() => {});
+			}
 		}
 	}
 
-	#registerWorkflowGateAskTool(): void {
-		if (!this.#workflowGateToolSession) return;
+	#registerWorkflowGateAskTool(): Promise<void> | undefined {
+		if (!this.#workflowGateToolSession) return undefined;
 
 		let askTool = this.#toolRegistry.get("ask");
 		if (!askTool) {
 			const createdAskTool = AskTool.createIf(this.#workflowGateToolSession);
-			if (!createdAskTool) return;
+			if (!createdAskTool) return undefined;
 			const wrappedTool = wrapToolWithMetaNotice(createdAskTool as unknown as AgentTool);
 			askTool = this.#extensionRunner ? new ExtensionToolWrapper(wrappedTool, this.#extensionRunner) : wrappedTool;
 			this.#toolRegistry.set(askTool.name, askTool);
@@ -8039,14 +8131,25 @@ export class AgentSession {
 
 		try {
 			if ((this.#workflowGateEmitter?.listPendingGates?.().length ?? 0) > 0) {
-				this.#attachAskTool();
+				return this.#attachAskTool().catch(error => {
+					logger.warn("Failed to attach workflow gate ask tool", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+					throw error;
+				});
 			}
 		} catch (error) {
 			logger.warn("Failed to inspect pending workflow gates; activating ask tool conservatively", {
 				error: error instanceof Error ? error.message : String(error),
 			});
-			this.#attachAskTool();
+			return this.#attachAskTool().catch(attachError => {
+				logger.warn("Failed to attach workflow gate ask tool", {
+					error: attachError instanceof Error ? attachError.message : String(attachError),
+				});
+				throw attachError;
+			});
 		}
+		return undefined;
 	}
 
 	async #attachAskToolIfWorkflowActive(): Promise<void> {
@@ -8075,22 +8178,19 @@ export class AgentSession {
 		}
 		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) {
 			if (!inMemoryActiveSkill) this.#restoredWorkflowSkillState = { skill: activeSkill.trim(), sessionId };
-			this.#attachAskTool();
+			await this.#attachAskTool();
 		} else if (this.#restoredWorkflowSkillState?.sessionId === sessionId) {
 			this.#restoredWorkflowSkillState = undefined;
 		}
 	}
 
-	#attachAskTool(): void {
+	async #attachAskTool(): Promise<void> {
 		const askTool = this.#toolRegistry.get("ask");
-		if (!askTool || this.getActiveToolNames().includes(askTool.name)) return;
-		this.#setGuardedAgentTools([...this.agent.state.tools, askTool]);
-		this.#invalidateDiscoveryCaches();
-		void this.refreshBaseSystemPrompt().catch(error => {
-			logger.warn("Failed to refresh system prompt after workflow gate ask tool activation", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-		});
+		if (!askTool) return;
+		await this.updateActiveToolsByName(
+			activeToolNames => (activeToolNames.includes(askTool.name) ? undefined : [...activeToolNames, askTool.name]),
+			"workflow-gate:attach-ask",
+		);
 	}
 
 	get goalRuntime(): GoalRuntime {
@@ -8604,21 +8704,21 @@ export class AgentSession {
 		});
 	}
 
+	#readSkillPromptName(message: Pick<CustomMessage<unknown>, "customType" | "details">): string | undefined {
+		if (message.customType !== SKILL_PROMPT_MESSAGE_TYPE) return undefined;
+		const details = message.details;
+		if (!details || typeof details !== "object") return undefined;
+		const name = (details as { name?: unknown }).name;
+		return typeof name === "string" && name.trim() ? name.trim() : undefined;
+	}
+
 	async #syncSkillPromptActiveState(
 		message: Pick<CustomMessage<unknown>, "customType" | "details">,
 		active: boolean,
 	): Promise<void> {
-		if (message.customType !== SKILL_PROMPT_MESSAGE_TYPE) return;
-		const details = message.details;
-		if (!details || typeof details !== "object") return;
-		const name = (details as { name?: unknown }).name;
-		if (typeof name !== "string" || !name.trim()) return;
-		const skill = name.trim();
-		// Functional tool availability must not depend on the best-effort
-		// observational state-sync below (whose failures are swallowed by
-		// #syncSkillPromptActiveStateSafely): attach ask first so canonical
-		// workflow skills can always call it.
-		if (active && isCanonicalGjcWorkflowSkill(skill)) this.#attachAskTool();
+		const skill = this.#readSkillPromptName(message);
+		if (!skill) return;
+		const details = message.details as Record<string, unknown>;
 		const sessionId = this.sessionManager.getSessionId();
 		// Canonical GJC workflow skills (deep-interview, ralplan, ultragoal, team)
 		// own their `.gjc/state/skill-active-state.json` row through the
@@ -8666,6 +8766,10 @@ export class AgentSession {
 		message: Pick<CustomMessage<unknown>, "customType" | "details">,
 		active: boolean,
 	): Promise<void> {
+		// Functional tool availability must not depend on best-effort observational
+		// state sync below. Propagate attachment failures before entering its catch.
+		const skill = this.#readSkillPromptName(message);
+		if (active && skill && isCanonicalGjcWorkflowSkill(skill)) await this.#attachAskTool();
 		try {
 			await this.#syncSkillPromptActiveState(message, active);
 		} catch {
@@ -13074,7 +13178,7 @@ export class AgentSession {
 			return;
 		}
 
-		this.#attachAskTool();
+		await this.#attachAskTool();
 
 		const reminder = prompt.render(planModeToolDecisionReminderPrompt, {
 			askToolName: "ask",

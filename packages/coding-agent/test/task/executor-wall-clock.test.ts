@@ -40,6 +40,9 @@ function createHangingSession(): HangingSessionHandle {
 		} as never,
 		getActiveToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_names: string[]) => {},
+		updateActiveToolsByName: async (update: (current: string[]) => string[] | undefined) => {
+			update([]);
+		},
 		setConfiguredModelChain: () => {},
 		getConfiguredModelChain: () => undefined,
 		seedDefaultFallbackResolution: () => {},
@@ -82,6 +85,9 @@ function createUsageSession(usages: unknown | readonly unknown[]): AgentSession 
 		sessionManager: { appendSessionInit: () => {} } as never,
 		getActiveToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async () => {},
+		updateActiveToolsByName: async (update: (current: string[]) => string[] | undefined) => {
+			update([]);
+		},
 		setConfiguredModelChain: () => {},
 		getConfiguredModelChain: () => undefined,
 		seedDefaultFallbackResolution: () => {},
@@ -213,6 +219,9 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			sessionManager: { appendSessionInit: () => {} } as never,
 			getActiveToolNames: () => ["read", "yield"],
 			setActiveToolsByName: async () => {},
+			updateActiveToolsByName: async (update: (current: string[]) => string[] | undefined) => {
+				update([]);
+			},
 			setConfiguredModelChain: () => {},
 			getConfiguredModelChain: () => undefined,
 			seedDefaultFallbackResolution: () => {},
@@ -307,6 +316,9 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			sessionManager: { appendSessionInit: () => {} } as never,
 			getActiveToolNames: () => ["read", "yield"],
 			setActiveToolsByName: async () => {},
+			updateActiveToolsByName: async (update: (current: string[]) => string[] | undefined) => {
+				update([]);
+			},
 			setConfiguredModelChain: () => {},
 			getConfiguredModelChain: () => undefined,
 			seedDefaultFallbackResolution: () => {},
@@ -373,6 +385,9 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			sessionManager: { appendSessionInit: () => {} } as never,
 			getActiveToolNames: () => ["read", "yield"],
 			setActiveToolsByName: async () => {},
+			updateActiveToolsByName: async (update: (current: string[]) => string[] | undefined) => {
+				update([]);
+			},
 			setConfiguredModelChain: () => {},
 			getConfiguredModelChain: () => undefined,
 			seedDefaultFallbackResolution: () => {},

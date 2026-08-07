@@ -40,6 +40,9 @@ function createMockSession(
 		},
 		getActiveToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async () => {},
+		updateActiveToolsByName: async (update: (current: string[]) => string[] | undefined) => {
+			update([]);
+		},
 		setConfiguredModelChain: () => {},
 		getConfiguredModelChain: () => undefined,
 		seedDefaultFallbackResolution: () => {},

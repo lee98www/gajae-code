@@ -48,6 +48,9 @@ function createEmptyOutputSession(): AgentSession {
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => ["yield"],
 		setActiveToolsByName: async () => {},
+		updateActiveToolsByName: async (update: (current: string[]) => string[] | undefined) => {
+			update([]);
+		},
 		setConfiguredModelChain: () => {},
 		getConfiguredModelChain: () => undefined,
 		seedDefaultFallbackResolution: () => {},

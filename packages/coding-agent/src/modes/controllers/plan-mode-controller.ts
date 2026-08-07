@@ -62,7 +62,7 @@ export class PlanModeController {
 	#enabled = false;
 	#paused = false;
 	#planFilePath: string | undefined;
-	#previousTools: string[] | undefined;
+	#resolveToolWasActive = true;
 	#previousModelState: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	#pendingModelSwitch: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	#providerSessionScope: TemporaryProviderSessionScope | undefined;
@@ -118,13 +118,14 @@ export class PlanModeController {
 		if (!this.ctx.modeGate.enter("plan")) return this.ctx.showWarning("Exit goal mode first.");
 		this.#paused = false;
 		const planFilePath = options?.planFilePath ?? "local://PLAN.md";
-		const previousTools = this.ctx.session.getActiveToolNames();
-		this.#previousTools = previousTools;
 		this.#planFilePath = planFilePath;
 		this.#enabled = true;
-		await this.ctx.session.setActiveToolsByName(
-			this.ctx.session.getToolByName("resolve") ? [...new Set([...previousTools, "resolve"])] : previousTools,
-		);
+		await this.ctx.session.updateActiveToolsByName(current => {
+			this.#resolveToolWasActive = current.includes("resolve");
+			return this.ctx.session.getToolByName("resolve") && !this.#resolveToolWasActive
+				? [...current, "resolve"]
+				: undefined;
+		}, "plan-mode:enter");
 		this.ctx.session.setPlanModeState({
 			enabled: true,
 			planFilePath,
@@ -143,7 +144,12 @@ export class PlanModeController {
 	async exit(options?: { silent?: boolean; paused?: boolean }): Promise<void> {
 		if (!this.#enabled) return;
 		await this.ctx.session.abort({ timeoutMs: ABORT_TIMEOUT_MS });
-		if (this.#previousTools?.length) await this.ctx.session.setActiveToolsByName(this.#previousTools);
+		if (!this.#resolveToolWasActive) {
+			await this.ctx.session.updateActiveToolsByName(
+				current => current.filter(name => name !== "resolve"),
+				"plan-mode:exit",
+			);
+		}
 		if (this.#providerSessionScope && !this.ctx.session.isStreaming) {
 			if (this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope))
 				this.#providerSessionScope = undefined;
@@ -166,7 +172,7 @@ export class PlanModeController {
 		this.#enabled = false;
 		this.#paused = options?.paused ?? false;
 		this.#planFilePath = undefined;
-		this.#previousTools = undefined;
+		this.#resolveToolWasActive = true;
 		this.#previousModelState = undefined;
 		if (!this.#paused) this.ctx.modeGate.exit("plan");
 		this.#updateStatus();
@@ -437,12 +443,13 @@ export class PlanModeController {
 		},
 	): Promise<void> {
 		await this.#finalizeApprovedPlan(planContent, options.planFilePath, options.finalPlanFilePath);
-		const previousTools = this.#previousTools ?? this.ctx.session.getActiveToolNames();
+		let executionToolNames: string[] = [];
 		if (options.compactBeforeExecute) this.ctx.session.markPlanCompactAbortPending();
 		let sessionSwitchCompleted = true;
 		let compactOutcome: CompactionOutcome | undefined;
 		try {
 			await this.exit({ silent: true });
+			executionToolNames = this.ctx.session.getActiveToolNames();
 			if (!options.preserveContext) {
 				sessionSwitchCompleted = await this.ctx.handleClearCommand();
 				if (sessionSwitchCompleted)
@@ -470,7 +477,12 @@ export class PlanModeController {
 		} finally {
 			this.ctx.session.clearPlanCompactAbortPending();
 		}
-		if (previousTools.length) await this.ctx.session.setActiveToolsByName(previousTools);
+		if (!options.preserveContext && executionToolNames.length) {
+			await this.ctx.session.updateActiveToolsByName(current => {
+				const merged = [...new Set([...current, ...executionToolNames])];
+				return merged.length === current.length ? undefined : merged;
+			}, "plan-mode:approved-session-restore");
+		}
 		if (!sessionSwitchCompleted)
 			return this.ctx.showWarning(
 				"Plan approved, but the new session could not be created — execution was not dispatched.",

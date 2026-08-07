@@ -54,6 +54,7 @@ export class GoalModeController {
 	#enabled = false;
 	#paused = false;
 	#previousTools: string[] | undefined;
+	#goalToolWasActive = true;
 	#continuationTimer: NodeJS.Timeout | undefined;
 	#turnHadToolCalls = false;
 	#continuationTurnInFlight = false;
@@ -177,7 +178,10 @@ export class GoalModeController {
 			const snapshotKey = goal ? `${goal.id}\u0000${goal.objective}` : undefined;
 			if (this.#goalHeldSnapshotKey !== undefined && this.#goalHeldSnapshotKey !== snapshotKey)
 				this.#resetContinuationSuppression();
-			if (event.state?.enabled && !this.#previousTools) this.#previousTools = this.ctx.session.getActiveToolNames();
+			if (event.state?.enabled && !this.#previousTools) {
+				this.#previousTools = this.ctx.session.getActiveToolNames();
+				this.#goalToolWasActive = true;
+			}
 			this.#enabled = event.state?.enabled === true;
 			this.#paused = event.state?.enabled !== true && event.state?.goal?.status === "paused";
 			if (this.#enabled || this.#paused) this.ctx.modeGate.enter("goal");
@@ -264,7 +268,10 @@ export class GoalModeController {
 			if (this.#enabled || this.#paused) this.ctx.modeGate.enter("goal");
 			if (restored?.goal) {
 				this.#previousTools = this.ctx.session.getActiveToolNames();
-				await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
+				await this.ctx.session.updateActiveToolsByName(current => {
+					this.#goalToolWasActive = current.includes("goal");
+					return this.#goalToolWasActive ? undefined : [...current, "goal"];
+				}, "goal-mode:restore");
 			}
 			this.#updateStatus();
 			return true;
@@ -321,7 +328,13 @@ export class GoalModeController {
 					objective: options.objective ?? "",
 					provenance: options.provenance,
 				});
-		await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
+		await this.ctx.session.updateActiveToolsByName(
+			current => {
+				this.#goalToolWasActive = current.includes("goal");
+				return this.#goalToolWasActive ? undefined : [...current, "goal"];
+			},
+			options.resume ? "goal-mode:resume" : "goal-mode:enter",
+		);
 		this.ctx.session.setGoalModeState(state);
 		this.#enabled = true;
 		this.#resetContinuationSuppression();
@@ -339,7 +352,12 @@ export class GoalModeController {
 			this.#previousTools &&
 			options?.reason !== "dropped" &&
 			(this.#enabled || options?.reason === "completed" || options?.paused);
-		if (shouldRestoreTools && this.#previousTools) await this.ctx.session.setActiveToolsByName(this.#previousTools);
+		if (shouldRestoreTools && !this.#goalToolWasActive) {
+			await this.ctx.session.updateActiveToolsByName(
+				current => current.filter(name => name !== "goal"),
+				"goal-mode:exit",
+			);
+		}
 		const currentState = this.ctx.session.getGoalModeState();
 		if (options?.reason === "completed") {
 			this.ctx.session.setGoalModeState(undefined);
@@ -353,6 +371,7 @@ export class GoalModeController {
 		this.#enabled = false;
 		this.#paused = options?.paused ?? false;
 		this.#previousTools = undefined;
+		this.#goalToolWasActive = true;
 		this.#continuationTurnInFlight = false;
 		this.#resetContinuationSuppression();
 		this.cancelContinuation();

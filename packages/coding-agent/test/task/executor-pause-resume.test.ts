@@ -51,6 +51,9 @@ function createPauseSession(options: CreateAgentSessionOptions, subagentId: stri
 		},
 		getActiveToolNames: () => ["yield"],
 		setActiveToolsByName: async (_toolNames: string[]) => {},
+		updateActiveToolsByName: async (update: (current: string[]) => string[] | undefined) => {
+			update([]);
+		},
 		setConfiguredModelChain: () => {},
 		getConfiguredModelChain: () => undefined,
 		seedDefaultFallbackResolution: () => {},
