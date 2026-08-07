@@ -94,9 +94,14 @@ async function ultragoalReadPaths(
 		const session = await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID });
 		return { paths: getUltragoalPaths(cwd, session.gjcSessionId), sessionId: session.gjcSessionId };
 	} catch (error) {
-		if (error instanceof SessionResolutionError && error.code === "no_session") {
-			// No session could be resolved (no env, no auto-detectable active session).
-			// Surface the null session id so callers can decide; ask-guard treats it as inactive.
+		if (error instanceof SessionResolutionError && (error.code === "no_session" || error.code === "ambiguous")) {
+			// No single session could be resolved: either no explicit id and no
+			// auto-detectable active session (`no_session`), or auto-detect found
+			// multiple concurrently-active sessions within the tie window
+			// (`ambiguous`). In both cases there is no single durable Ultragoal run
+			// for this process to protect, so surface a null session id; the ask
+			// guard treats it as inactive and falls open instead of blocking every
+			// agent's `ask` whenever two unrelated sessions are active at once.
 			return { paths: getUltragoalPaths(cwd, null), sessionId: null };
 		}
 		throw error;

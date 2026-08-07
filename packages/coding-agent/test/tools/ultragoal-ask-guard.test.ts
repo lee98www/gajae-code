@@ -348,4 +348,29 @@ describe("ultragoal ask guard", () => {
 			else process.env.GJC_SESSION_ID = previousSessionId;
 		}
 	});
+
+	it("allows ask when GJC_SESSION_ID is absent and multiple sessions are ambiguously latest", async () => {
+		const cwd = await tempDir();
+		const previousSessionId = process.env.GJC_SESSION_ID;
+		// Two concurrently-active session-scoped ultragoal runs, created back-to-back so
+		// their activity markers tie within LATEST_SESSION_TIE_WINDOW_MS. With no
+		// GJC_SESSION_ID, auto-detect is ambiguous and cannot pick a single session, so
+		// the ask guard must fall open instead of blocking every agent's ask whenever two
+		// unrelated sessions are concurrently active.
+		try {
+			process.env.GJC_SESSION_ID = "ambiguous-session-a";
+			await createUltragoalPlan({ cwd, brief: "Story A" });
+			process.env.GJC_SESSION_ID = "ambiguous-session-b";
+			await createUltragoalPlan({ cwd, brief: "Story B" });
+			delete process.env.GJC_SESSION_ID;
+
+			const diagnostic = await isUltragoalAskBlocked(cwd);
+
+			expect(diagnostic.active).toBe(false);
+			expect(diagnostic.source).toBe("absent");
+		} finally {
+			if (previousSessionId === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = previousSessionId;
+		}
+	});
 });
