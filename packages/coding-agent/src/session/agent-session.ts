@@ -9747,6 +9747,26 @@ export class AgentSession {
 		};
 	}
 
+	/**
+	 * Re-root the per-turn volatile workspace tree after the session's working
+	 * directory changed (`/move`). Drops the launch-cwd-bound tree service and
+	 * every cached snapshot so the next volatile context message rescans from
+	 * `sessionManager.getCwd()` via the direct-scan fallback. Without this, the
+	 * tree keeps describing the old directory for the rest of the session.
+	 */
+	async rescopeWorkspaceTree(): Promise<void> {
+		this.#initialWorkspaceTree = undefined;
+		this.#cachedWorkspaceTree = undefined;
+		this.#cachedWorkspaceTreeAt = 0;
+		const service = this.#workspaceTreeService;
+		if (service) {
+			// The service captured the launch cwd at construction; the direct-scan
+			// fallback in #buildVolatileProjectContextMessage reads the live cwd.
+			this.#workspaceTreeService = undefined;
+			await service.dispose();
+		}
+	}
+
 	async #buildVolatileProjectContextMessage(): Promise<CustomMessage> {
 		const cwd = this.sessionManager.getCwd();
 		// Date + cwd are refreshed every turn (cheap). The mtime-sorted workspace

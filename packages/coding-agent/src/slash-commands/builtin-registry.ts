@@ -1977,6 +1977,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return usage(`Move failed: ${errorMessage(err)}`, runtime);
 			}
 			setProjectDir(resolvedPath);
+			// Re-root the per-turn workspace-tree snapshot; without this it keeps
+			// describing the previous directory for the rest of the session.
+			await runtime.session.rescopeWorkspaceTree();
 			// Reload plugin/capability caches so the next prompt sees commands and
 			// capabilities scoped to the new cwd.
 			await runtime.reloadPlugins();

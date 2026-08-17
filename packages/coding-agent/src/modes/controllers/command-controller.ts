@@ -1152,6 +1152,9 @@ export class CommandController {
 			await this.ctx.sessionManager.flush();
 			await this.ctx.sessionManager.moveTo(resolvedPath);
 			setProjectDir(resolvedPath);
+			// Re-root the per-turn workspace-tree snapshot; without this it keeps
+			// describing the previous directory for the rest of the session.
+			await this.ctx.session.rescopeWorkspaceTree();
 			clearClaudePluginRootsCache(); // re-warms preloadedPluginRoots with new project dir (async)
 			resetCapabilities();
 			await this.ctx.refreshSlashCommandState(resolvedPath);
